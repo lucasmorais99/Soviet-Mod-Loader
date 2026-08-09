@@ -1,3 +1,5 @@
+# DISCLAIMER: Artificial Intelligence (AI) has been used throughout developing this project. It has enabled me, a long-time fan of modding games with an average technical expertise, to share my passion with many others around the world.
+
 # Soviet Mod Loader
 
 Workshop-first mod management implemented as one TesmioLoader API v3 plugin for
