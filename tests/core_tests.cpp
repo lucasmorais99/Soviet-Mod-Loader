@@ -4,12 +4,19 @@
 #include <fstream>
 #include <string>
 
-#include "../plugins/000_soviet_mod_loader/000_soviet_mod_loader.cpp"
+#define SML_TESTING 1
+#include "../plugins/soviet_mod_loader/soviet_mod_loader.cpp"
 
 extern "C" unsigned SmlDepositsNoiseChecksumForTest(unsigned __int64 seed);
+extern "C" unsigned SmlDepositsNoiseChecksumWithOffsetForTest(unsigned __int64 seed,
+                                                               float offset);
+extern "C" void SmlDepositsNoiseStatsForTest(unsigned __int64 seed, float offset,
+                                               unsigned __int64* sum, unsigned* nonzero);
 extern "C" int SmlDepositsShouldGenerateForTest(int manifestValid, int ddsExists,
                                                   int initialized);
 extern "C" int SmlDepositsChannelIsolationForTest(unsigned __int64 seed, int component);
+extern "C" int SmlDepositsResolveWorldPathForTest(const char* mediaRoot, const char* folder,
+                                                    char* out, size_t n);
 
 static int failures = 0;
 #define CHECK(x) do { if (!(x)) { std::printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #x); ++failures; } } while (0)
@@ -49,8 +56,30 @@ int main() {
     CHECK(SmlDepositsShouldGenerateForTest(1, 0, 1));  // manifest cannot replace a DDS
     unsigned noiseA = SmlDepositsNoiseChecksumForTest(0x123456789abcdef0ull);
     CHECK(noiseA == SmlDepositsNoiseChecksumForTest(0x123456789abcdef0ull));
+    CHECK(noiseA == SmlDepositsNoiseChecksumWithOffsetForTest(0x123456789abcdef0ull, 0.0f));
     CHECK(noiseA != SmlDepositsNoiseChecksumForTest(0x123456789abcdef1ull));
+    CHECK(noiseA != SmlDepositsNoiseChecksumWithOffsetForTest(0x123456789abcdef0ull, 0.03f));
+    unsigned __int64 sumLow = 0, sumBase = 0, sumHigh = 0;
+    unsigned countLow = 0, countBase = 0, countHigh = 0;
+    SmlDepositsNoiseStatsForTest(0x123456789abcdef0ull, -0.25f, &sumLow, &countLow);
+    SmlDepositsNoiseStatsForTest(0x123456789abcdef0ull, 0.0f, &sumBase, &countBase);
+    SmlDepositsNoiseStatsForTest(0x123456789abcdef0ull, 0.25f, &sumHigh, &countHigh);
+    CHECK(sumLow <= sumBase && sumBase <= sumHigh);
+    CHECK(countLow <= countBase && countBase <= countHigh);
+    CHECK(sumLow < sumHigh && countLow < countHigh);
     CHECK(SmlDepositsChannelIsolationForTest(0x123456789abcdef0ull, 2));
+    char resolved[MAX_PATH];
+    std::filesystem::path policyRoot = std::filesystem::temp_directory_path() / "sml-path-policy" / "media_soviet";
+    std::string policyRootText = policyRoot.u8string();
+    CHECK(SmlDepositsResolveWorldPathForTest(policyRootText.c_str(), "saved_last", resolved, sizeof(resolved)));
+    CHECK(std::filesystem::path(resolved) == policyRoot / "saved_last");
+    CHECK(SmlDepositsResolveWorldPathForTest(policyRootText.c_str(), "save/world", resolved, sizeof(resolved)));
+    CHECK(std::filesystem::path(resolved) == policyRoot / "save/world");
+    CHECK(SmlDepositsResolveWorldPathForTest(policyRootText.c_str(), "media_soviet\\campaign1", resolved, sizeof(resolved)));
+    CHECK(std::filesystem::path(resolved) == policyRoot / "campaign1");
+    CHECK(!SmlDepositsResolveWorldPathForTest(policyRootText.c_str(), "save\\..\\outside", resolved, sizeof(resolved)));
+    std::string outside = (policyRoot.parent_path() / "outside").u8string();
+    CHECK(!SmlDepositsResolveWorldPathForTest(policyRootText.c_str(), outside.c_str(), resolved, sizeof(resolved)));
     CHECK(ShouldRequestConfirmation("always", "same", "same", true));
     CHECK(!ShouldRequestConfirmation("changes", "same", "same", true));
     CHECK(ShouldRequestConfirmation("changes", "new", "old", true));
@@ -113,7 +142,7 @@ int main() {
         ("sml-integration-" + std::to_string(GetCurrentProcessId()));
     std::filesystem::path base = root / "tesmioloader";
     std::filesystem::path workshop = root / "workshop";
-    Put(base / "plugins/resources.ini", "[resources]\nhook=2\n[list]\nbase_only=rawiron\n");
+    Put(base / "plugins/resources.ini", "[resources]\nhook=1\n[list]\nbase_only=rawiron\n");
     Put(workshop / "100/soviet.mod.ini",
         "[mod]\nid=org.test.first\nname=First\nversion=1.0.0\nadded_utc=100\n"
         "tesmio_api_min=3\ntesmio_api_max=3\n[content]\nresources=tesmio/resources.ini\n");
@@ -128,6 +157,9 @@ int main() {
     Put(workshop / "200/tesmio/deposits.ini",
         "[automatic_ore]\ntoken=$TYPE_MINE_AUTOMATIC\nradius=ore\nmap=auto\n");
     Put(workshop / "200/assets/media_soviet/resources/shared.txt", "asset-v1");
+    Put(root / "media_soviet/buildings_types/fabric_factory.ini", "$NAME 1\n");
+    Put(root / "media_soviet/buildings/fabric_factory.nmf", "fixture");
+    Put(root / "media_soviet/buildings/fabric_factory.mtl", "fixture");
     fakeWorkshop = workshop.u8string();
     std::string baseText = base.u8string();
     TsmHost host{}; host.apiVersion = 3; host.structSize = sizeof(host); host.baseDir = baseText.c_str();
@@ -136,6 +168,7 @@ int main() {
     TsmPluginInfo plugin{};
     CHECK(TsmPluginInit(&host, &plugin) == 0);
     std::string merged; CHECK(ReadText(base / "plugins/resources.ini", merged));
+    CHECK(merged.find("hook = 2") != std::string::npos);
     CHECK(merged.find("shared = bauxite, Second") != std::string::npos);
     CHECK(merged.find("shared = 57") == std::string::npos);
     CHECK(merged.find("base_only = rawiron") != std::string::npos);
@@ -153,11 +186,45 @@ int main() {
     auto expectedGeneratedWip = ExpectedWipBuildings();
     CHECK(expectedGeneratedWip[std::to_string(buildingId)] == "automatic_factory");
     generatedError.clear(); CHECK(LoadIni(base / "plugins/deposits.ini", generatedDeposits, generatedError));
+    CHECK(generatedDeposits.get("deposits", "code_patch") == "1");
     int depositType = std::atoi(generatedDeposits.get("automatic_ore", "type").c_str());
     CHECK(depositType >= 10 && depositType <= 127);
     CHECK(generatedDeposits.get("automatic_ore", "map") == "auto");
     CHECK(generatedDeposits.get("automatic_ore", "component").empty());
     CHECK(std::filesystem::is_regular_file(base / "soviet_mod_loader/catalog.ini"));
+
+    // richness_offset is validated before the application phase.
+    std::string validDepositPlan;
+    for (auto& plan : g_domainPlans) if (plan.domain == "deposits") {
+        validDepositPlan = plan.mergedText;
+        Ini planned; std::string plannedError;
+        CHECK(ParseIniText(plan.mergedText, planned, plannedError));
+        Section* deposit = planned.find("automatic_ore"); CHECK(deposit != nullptr);
+        if (deposit) deposit->entries.push_back({"richness_offset", "0.251", 0});
+        plan.mergedText = SerializeIni(planned);
+    }
+    CHECK(!ValidatePlannedContent());
+    CHECK(std::any_of(g_validationErrors.begin(), g_validationErrors.end(), [](const std::string& e) {
+        return e.find("richness_offset") != std::string::npos;
+    }));
+    for (auto& plan : g_domainPlans) if (plan.domain == "deposits") plan.mergedText = validDepositPlan;
+    CHECK(ParseRichnessOffset("-0.25"));
+    CHECK(ParseRichnessOffset("+0.25"));
+    CHECK(!ParseRichnessOffset("nan"));
+    CHECK(!ParseRichnessOffset("not-a-number"));
+
+    // Static validation must reject a missing cross-domain resource before application.
+    for (auto& plan : g_domainPlans) if (plan.domain == "buildings") {
+        Ini planned; std::string plannedError;
+        CHECK(ParseIniText(plan.mergedText, planned, plannedError));
+        Section* factory = planned.find("automatic_factory"); CHECK(factory != nullptr);
+        if (factory) factory->entries.push_back({"line", "$PRODUCTION definitely_missing 0.1", 0});
+        plan.mergedText = SerializeIni(planned);
+    }
+    CHECK(!ValidatePlannedContent());
+    CHECK(std::any_of(g_validationErrors.begin(), g_validationErrors.end(), [](const std::string& e) {
+        return e.find("definitely_missing") != std::string::npos;
+    }));
     std::filesystem::remove_all(root, ec);
 
     if (failures) return 1;

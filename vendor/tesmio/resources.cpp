@@ -32,7 +32,7 @@
 // slot to be sold from. See the ExtendCustomsStorage block below, which reruns
 // that same walk against the live vector once per customhouse.
 //
-// Everything here is addresses for SOVIET64.exe v1.1.1.7. See
+// Everything here is addresses for SOVIET64.exe v1.1.1.9. See
 // docs/04-adding-resources.md.
 
 #include "tesmio_plugin.h"
@@ -54,9 +54,10 @@
 // C3D_MIDDLEPOINT, the object every managed asset is created through.
 #define P_MIDDLEPOINT   0x9EACD0
 
-// SOVIET64.exe v1.1.1.7. Verified against the prologue below before hooking, so
+// SOVIET64.exe v1.1.1.9. Verified against the prologue below before hooking, so
 // a game update makes the hook refuse to install rather than corrupt the process.
-#define DEFAULT_RESOURCEGET_RVA 0x2AA7C0
+// Was 0x2AA7C0 in v1.1.1.7; the prologue found it again 0x70 further on.
+#define DEFAULT_RESOURCEGET_RVA 0x2AA830
 
 static const BYTE kResourceGetPrologue[] = {
     0x40, 0x55,                                     // push rbp
@@ -69,6 +70,7 @@ static const BYTE kResourceGetPrologue[] = {
 #define STOLEN_BYTES (sizeof(kResourceGetPrologue))
 
 static int    g_resHook = 1;      // 0 off, 1 observe only, 2 observe + inject
+static bool   g_smlResourceHookReady;
 static DWORD  g_resRva  = DEFAULT_RESOURCEGET_RVA;
 static LONG   g_nInjected;
 static HANDLE g_hRes = INVALID_HANDLE_VALUE;
@@ -206,11 +208,134 @@ static bool g_warnedCapacity;
 #define RES_BASE_RUB   0x78
 #define RES_BASE_USD   0x7C
 
+// The resource's icon texture, filled by the UI pass at 0x2960DE from
+// "resources/<name>.png" - the one asset the engine finds by name.
+#define RES_ICON_OFF   0x48
+
+// ---------------------------------------------------------------- the rest of the record
+//
+// **The whole 832-byte record, and not one byte of it guessed.** The engine's
+// resource table at 0x2A1D60 builds each record in one stack buffer whose rbp is
+// `record + 0xC0` and commits it with `add qword ptr [rbx+8],0x340` (records
+// 0..34) or `call 0x449350(vector, record)` (35..56). Reading that code back and
+// replaying every write through rbp gives the exact contents of all 57 base-game
+// records, which is how the map below was made rather than by diffing live
+// memory - see tools/pe/restable.py, which prints it.
+//
+// Only 30 of the 832 bytes are ever written per resource. Everything else is
+// zero at push time and filled at runtime: the icon at +0x48, the previous
+// price at +0x70/+0x74, the previous base at +0x80/+0x84 and the five mesh
+// pointers from +0x318. **That is what makes a record with no template
+// possible** - a from-scratch record is a zeroed one plus this list.
+//
+//   +0x00  name, inline, 32 bytes         +0x40  caption id     +0x44  price kind
+//   +0x50  \ set on nine records only: nuclearfuelburned 127, waste_toxic 84,
+//   +0x54  / usagewater 1, the four landfill wastes 0.3..1. Reader not found.
+//   +0x58/+0x5C  price RUB/USD            +0x78/+0x7C  base price RUB/USD
+//   +0x88 and +0xA8  two identical 0x20-byte market blocks, below
+//   +0xC8  one byte, below
+//   +0xCC  eighteen 0x20-byte transport-class blocks, below
+//   +0x30C the material family, below     +0x310 0.3 everywhere but workers
+//                                                and eletric, which are 1.0
+//
+// **Two market blocks, byte-identical in shape**, at +0x88 and +0xA8:
+//
+//   +0x00 sell multiplier, 0.95     +0x04 buy multiplier, 1.05
+//   +0x10, +0x14  two large figures - eletric 40000/60000, coal 9500/9500,
+//                 iron 6500/7500, and 200/350 (first block) with 500/500
+//                 (second) on twelve resources including every waste
+//   +0x18 0.5, or 0.65 on coal, 0.75 on chemicals/bitumen, 0.85 on the liquids
+//   +0x1C 1.0 - the only field in the whole record that is the same in all 57
+//
+// The pair at +0x88/+0x8C is the one 02-findings.md already identified: the
+// trade window quotes the price times +0x8C to buy and times +0x88 to sell. The
+// second block carries the same two multipliers and a different pair of large
+// figures, so **which block is which currency is not established here** - the
+// naming below follows the order of the price pair at +0x58/+0x5C and nothing
+// stronger. Three resources are untradeable - workers, vehicles, trains - and
+// they are exactly the three whose blocks are entirely zero but for +0xA4/+0xC4.
+#define RES_MARKET_RUB    0x88
+#define RES_MARKET_USD    0xA8
+#define RES_MARKET_SELL   0x00
+#define RES_MARKET_BUY    0x04
+#define RES_MARKET_LIM1   0x10
+#define RES_MARKET_LIM2   0x14
+#define RES_MARKET_K      0x18
+#define RES_MARKET_ONE    0x1C
+
+// A byte, and its distribution is exact: 1 on plants, chemicals, uf6,
+// nuclearfuel, nuclearfuelburned, fabric, alcohol, food, clothes, meat,
+// ecomponents, mcomponents, plastics, eletronics and explosives, 0 on the other
+// 42. **Those fifteen are precisely the resources whose primary transport class
+// is COVERED, COOLER, NUCLEAR1 or NUCLEAR2**, and they are also the fifteen with
+// no cargo geometry of their own in media_soviet/resources - the goods a lorry
+// carries as a crate or a container. The rule reproduces all 57 records with no
+// exception, which is why `packed = auto` below can derive it; what reads the
+// byte has not been established.
+#define RES_PACKED_OFF    0xC8
+
+// Eighteen transport-class blocks, one per RESOURCE_TRANSPORT_* in
+// media_soviet/scripts/SOVIETInstructions.txt (COVERED 0 .. WASTE 17,
+// RESOURCE_TRANSPORT_NUM 18), 0x20 bytes each, +0xCC..+0x30C.
+//
+// The count is not inferred from the enum: the table's own prologue zeroes the
+// array with `mov ecx,0x12` - eighteen - and 0x2A1B80, which every resource
+// block calls before writing its classes, clears exactly eighteen blocks of
+// [+0x00,+0x14) plus the flag at +0x1C. A resource declares one class, sometimes
+// two, and the rest stay zero.
+//
+//   +0x00  capacity factor. Proven: the building.ini parser multiplies a
+//          $STORAGE capacity by it (`mulss xmm0,[rax+rbx+0xCC]` at 0x117B91),
+//          which is why a storage whose class differs from the resource's own
+//          reports 0.00 of 0.00 t.
+//   +0x04  \ two figures the base game sets per class rather than per resource:
+//   +0x08  / GRAVEL 0.5/30 on nine of thirteen, OPEN 1.25/2.5, OIL and WATER
+//          5/5, CONCRETE 5/20, ELETRIC and HEATING 1/1. What reads them has not
+//          been established, so kTransportClasses ships the base game's own
+//          numbers per class and they are only worth overriding deliberately.
+//   +0x0C  \ 0.05 on exactly the classes that move a liquid through a pipe -
+//   +0x10  / OIL, WATER, SEWAGE - and zero on the other fifteen.
+//   +0x1C  a byte. Set on cement/alumina/meat GENERAL and livestock COVERED and
+//          GENERAL, always on a *second* class and never on a primary one. The
+//          customhouse sync below reads it as "not tradeable in this class",
+//          which is the one behaviour that depends on it.
+#define RES_CLASS_BASE    0xCC
+#define RES_CLASS_STRIDE  0x20
+#define RES_CLASS_COUNT   18
+#define RES_CLASS_FACTOR  0xCC   // == RES_CLASS_BASE + 0x00, the name the customs code uses
+#define RES_CLASS_F1      0x04
+#define RES_CLASS_F2      0x08
+#define RES_CLASS_F3      0x0C
+#define RES_CLASS_F4      0x10
+#define RES_CLASS_FLAG    0x1C
+#define RES_CLASS_BLOCKED 0xE8   // == RES_CLASS_BASE + RES_CLASS_FLAG
+
+// An int, -1 on workers, eletric, heat, water and usagewater - the five with no
+// material form - and 10..19 on the other 52. **Each of the ten values holds
+// exactly one waste resource**: 10 waste_gravel with gravel, bricks, cement,
+// asphalt and concrete; 11 waste_steel with steel, iron and mcomponents; 12
+// waste_aluminium with the bauxite chain; 13 waste_plastic with plastics and
+// electronics; 14 waste_bio with plants; 15 fertiliser with food, meat and
+// livestock; 16 waste_burnable with wood and boards; 17 waste_toxic with the
+// chemicals, fuels and nuclear chain; 18 waste_other with fabric, clothes,
+// vehicles and trains; 19 waste_ash with coal. So it is a material family and
+// the sorted-waste mapping is the obvious thing it would be for, but what reads
+// it has not been established - hence -1, a value five base records carry, as
+// the default.
+#define RES_FAMILY_OFF    0x30C
+#define RES_FAMILY_FIRST  10
+
+// 1.0 on workers and eletric, 0.3 on the other 55, including heat and water.
+// Unidentified.
+#define RES_TAIL_OFF      0x310
+
 // C3D_GAME::RecomputeResourcePrices(game). Loops the whole resource vector and
 // writes +0x58 and +0x5C for every record, skipping kind -1 and pinning kind
 // -5 to 1.0. Called from world init at 0x28ED78 and from the economy module at
 // 0x2FBB95, each time followed by 0x2A9F40.
-#define DEFAULT_PRICEPASS_RVA 0x2A92D0
+// v1.1.1.9; was 0x2A92D0. Confirmed by what it reads rather than by the shift:
+// the function still walks the resource vector through self+0xC2B0/+0xC2B8.
+#define DEFAULT_PRICEPASS_RVA 0x2A9340
 
 static const BYTE kPricePassPrologue[] = {
     0x48, 0x89, 0x6C, 0x24, 0x18,   // mov  [rsp+18h], rbp
@@ -266,10 +391,11 @@ struct ResEntry
     char    name[64];
     int     index;       // -1 = auto, resolved against the live count at arm time
     int     resolved;    // the index actually claimed
-    int     tmplIndex;
+    int     tmplIndex;   // -1 when there is no template at all
     wchar_t display[64];
     int     textId;
     bool    armed;
+    bool    custom;      // built from a zeroed record rather than cloned
 };
 
 // How many names [list] may declare. Nothing in the engine chooses this number
@@ -336,6 +462,428 @@ static bool ParseMoneyPair(char* v, float* rub, float* usd)
     return true;
 }
 
+// ---------------------------------------------------------------- a record with no template
+//
+// The other half of [list]. A resource declared as `<name> = custom` starts from
+// a zeroed record instead of a clone, and everything the record holds comes from
+// its own `[custom:<name>]` section, defaulted to the base game's own numbers.
+//
+// **Both halves run the same code.** A `[custom:<name>]` section is a list of
+// (offset, type, value) writes applied to the record after it has been zeroed
+// *or* cloned, so the same section can also retune one field of a template-based
+// resource - `[custom:copper_ore]` with `kind = 1` on an entry cloned from
+// rawiron - and the clone path is untouched for anything that does not have one.
+//
+// Keyed by name rather than by [list] position, the way PriceEntryFor is, so a
+// section may appear anywhere in the file, before or after the entry it
+// configures.
+
+// The eighteen transport classes and, per class, the numbers the base game uses
+// for them. Every figure here was read out of the resource table rather than
+// invented: where the base game disagrees with itself the commonest value wins,
+// and the comment says how wide the spread was.
+struct TransportClass
+{
+    const char* name;
+    float factor, f1, f2, f3, f4;
+};
+
+// **0.049999997f, not 0.05f.** The game's own constant for the liquid classes is
+// 0x3D4CCCCC and `0.05f` compiles to 0x3D4CCCCD - the base game's compiler
+// truncated the decimal towards zero where a modern one rounds to nearest, so
+// every float constant in the executable can be one ULP low. It makes no
+// difference to anything the field does; it is spelled exactly here so that
+// tools/pe/restable.py --verify can report a rebuilt record as byte-for-byte
+// identical, which is the check that says nothing in the layout was missed.
+#define RES_LIQUID_F 0.049999997f
+
+static const TransportClass kTransportClasses[RES_CLASS_COUNT] = {
+    { "covered",   0.50f, 2.50f,  2.50f, 0.0f, 0.0f },  // 12 users, factor 0.25..0.8
+    { "open",      1.00f, 1.25f,  2.50f, 0.0f, 0.0f },  // 8 users, wood and boards exactly this
+    { "gravel",    1.00f, 0.50f, 30.00f, 0.0f, 0.0f },  // 9 of 13 users exactly this
+    { "oil",       1.00f, 5.00f,  5.00f, RES_LIQUID_F, RES_LIQUID_F },  // all four identical
+    { "cement",    1.00f, 1.50f,  1.50f, 0.0f, 0.0f },  // cement, alumina
+    { "cooler",    0.50f, 3.50f,  3.50f, 0.0f, 0.0f },  // meat
+    { "livestock", 0.75f, 4.00f,  4.00f, 0.0f, 0.0f },  // livestock
+    { "passanger", 1.00f, 5.00f,  5.00f, 0.0f, 0.0f },  // workers - the game's own spelling
+    { "concrete",  1.00f, 5.00f, 20.00f, 0.0f, 0.0f },  // concrete
+    { "eletric",   1.00f, 1.00f,  1.00f, 0.0f, 0.0f },  // eletric - the game's own spelling
+    { "vehicles",  1.00f, 1.00f,  1.00f, 0.0f, 0.0f },  // vehicles, trains
+    { "general",   1.00f, 1.25f,  2.50f, 0.0f, 0.0f },  // mirrors the primary, see below
+    { "nuclear1",  1.00f, 2.50f,  2.50f, 0.0f, 0.0f },  // uf6
+    { "nuclear2",  1.00f, 2.50f,  2.50f, 0.0f, 0.0f },  // nuclearfuel(+burned)
+    { "heating",   1.00f, 1.00f,  1.00f, 0.0f, 0.0f },  // heat
+    { "water",     1.00f, 5.00f,  5.00f, RES_LIQUID_F, RES_LIQUID_F },  // water, usagewater
+    { "sewage",    1.00f, 5.00f,  5.00f, RES_LIQUID_F, RES_LIQUID_F },  // water, usagewater
+    { "waste",     1.00f, 2.50f,  2.50f, 0.0f, 0.0f },  // 6 of 10 users exactly this
+};
+
+// A class by name, by the game's own $STORAGE token, or by number. Accepting the
+// token form means a line can be copied straight out of a building.ini.
+static int TransportClassIndex(const char* s)
+{
+    if (!s || !s[0]) return -1;
+    if (_strnicmp(s, "RESOURCE_TRANSPORT_", 19) == 0) s += 19;
+
+    if (s[0] >= '0' && s[0] <= '9')
+    {
+        int n = atoi(s);
+        return (n >= 0 && n < RES_CLASS_COUNT) ? n : -1;
+    }
+    for (int i = 0; i < RES_CLASS_COUNT; i++)
+        if (_stricmp(kTransportClasses[i].name, s) == 0) return i;
+    return -1;
+}
+
+// The ten material families at +0x30C, named after the one waste resource each
+// of them contains. A number is accepted too, and -1 means none.
+static const char* kFamilyNames[10] = {
+    "gravel", "steel", "aluminium", "plastic", "bio",
+    "food",   "burnable", "toxic", "other", "ash"
+};
+
+static int FamilyIndex(const char* s)
+{
+    if (!s || !s[0]) return -1;
+    if (_stricmp(s, "none") == 0) return -1;
+    if (s[0] == '-' || (s[0] >= '0' && s[0] <= '9')) return atoi(s);
+
+    if (_strnicmp(s, "waste_", 6) == 0) s += 6;
+    for (int i = 0; i < 10; i++)
+        if (_stricmp(kFamilyNames[i], s) == 0) return RES_FAMILY_FIRST + i;
+    return -2;                                   // said something, meant nothing
+}
+
+// Which cargo geometry to look for. `auto` is the files on disk for a custom
+// record and the template's own mesh slots for a clone - the shape has to come
+// from somewhere, and a zeroed record cannot answer it.
+enum { CARGO_AUTO = 0, CARGO_NONE, CARGO_BULK, CARGO_OPEN };
+
+enum { RW_F32, RW_I32, RW_U8 };
+
+struct ResWrite
+{
+    unsigned short off;
+    unsigned char  kind;
+    float          f;
+    int            i;
+};
+
+// 96 writes is six full transport classes plus every named field twice over;
+// the whole record only has 30 bytes of content to write.
+#define RES_MAX_WRITES 96
+
+struct CustomEntry
+{
+    char     name[64];
+    ResWrite w[RES_MAX_WRITES];
+    int      nWrites;
+    int      cargo;          // CARGO_*
+    int      primary;        // the class `transport =` named, or -1
+    bool     packedSet;      // an explicit `packed =` beats the auto rule
+    bool     overflow;
+};
+
+static CustomEntry g_custom[RES_MAX_ENTRIES];
+static int         g_customCount;
+static int         g_customReport = 0;   // dump every built record, field by field
+
+static CustomEntry* CustomLookup(const char* name)
+{
+    for (int i = 0; i < g_customCount; i++)
+        if (_stricmp(g_custom[i].name, name) == 0) return &g_custom[i];
+    return NULL;
+}
+
+static CustomEntry* CustomFor(const char* name)
+{
+    if (CustomEntry* e = CustomLookup(name)) return e;
+    if (g_customCount >= RES_MAX_ENTRIES) return NULL;
+
+    CustomEntry& e = g_custom[g_customCount++];
+    memset(&e, 0, sizeof(e));
+    strncpy_s(e.name, sizeof(e.name), name, _TRUNCATE);
+    e.cargo   = CARGO_AUTO;
+    e.primary = -1;
+    return &e;
+}
+
+static void Emit(CustomEntry* c, int off, int kind, float f, int i)
+{
+    if (off < 0 || off + (kind == RW_U8 ? 1 : 4) > RES_STRIDE)
+    {
+        Logf("registry  \"%s\": offset 0x%X is outside the %d-byte record - ignored",
+             c->name, off, RES_STRIDE);
+        return;
+    }
+    if (c->nWrites >= RES_MAX_WRITES)
+    {
+        if (!c->overflow)
+        {
+            c->overflow = true;
+            Logf("registry  \"%s\": more than %d field writes - the rest are ignored",
+                 c->name, RES_MAX_WRITES);
+        }
+        return;
+    }
+    ResWrite& w = c->w[c->nWrites++];
+    w.off  = (unsigned short)off;
+    w.kind = (unsigned char)kind;
+    w.f    = f;
+    w.i    = i;
+}
+
+static void EmitF(CustomEntry* c, int off, float v) { Emit(c, off, RW_F32, v, 0); }
+static void EmitI(CustomEntry* c, int off, int v)   { Emit(c, off, RW_I32, 0.0f, v); }
+static void EmitB(CustomEntry* c, int off, int v)   { Emit(c, off, RW_U8,  0.0f, v); }
+
+// "a, b, c" -> up to `max` floats, returning how many were actually there.
+// Destructive on `v`, like everything else in this parser.
+static int ParseFloatList(char* v, float* out, int max)
+{
+    int n = 0;
+    while (v && *v && n < max)
+    {
+        char* next = strchr(v, ',');
+        if (next) *next++ = 0;
+        Trim(v);
+        if (!v[0]) break;
+        out[n++] = (float)atof(v);
+        v = next;
+    }
+    return n;
+}
+
+// One transport class, with as much or as little of it as the line gave.
+// `general` with no numbers mirrors the primary class, because that is what ten
+// of the twelve base-game resources declaring a second class do.
+static void EmitClass(CustomEntry* c, int cls, const float* v, int n)
+{
+    const TransportClass& t = kTransportClasses[cls];
+    const TransportClass* d = &t;
+
+    if (cls == 11 && n == 0 && c->primary >= 0)      // GENERAL, mirroring
+        d = &kTransportClasses[c->primary];
+
+    int base = RES_CLASS_BASE + cls * RES_CLASS_STRIDE;
+    EmitF(c, base,                 n > 0 ? v[0] : d->factor);
+    EmitF(c, base + RES_CLASS_F1,  n > 1 ? v[1] : d->f1);
+    EmitF(c, base + RES_CLASS_F2,  n > 2 ? v[2] : d->f2);
+    EmitF(c, base + RES_CLASS_F3,  d->f3);
+    EmitF(c, base + RES_CLASS_F4,  d->f4);
+    EmitB(c, base + RES_CLASS_FLAG, n > 3 ? (int)v[3] : 0);
+}
+
+// One `key = value` line of a [custom:<name>] section. Unknown keys are called
+// out rather than skipped silently: a misspelt field that quietly does nothing
+// is exactly the class of bug this project keeps re-learning.
+static void ParseCustomLine(CustomEntry* c, char* key, char* value)
+{
+    Trim(key);
+    Trim(value);
+
+    float v[6];
+
+    // `transport` and `class` are the same line; the first also records which
+    // class is the primary one, which is what `general` mirrors and what the
+    // packed byte is derived from.
+    if (_stricmp(key, "transport") == 0 || _stricmp(key, "class") == 0)
+    {
+        bool primary = (key[0] == 't' || key[0] == 'T');
+
+        char* rest = strchr(value, ',');
+        if (rest) *rest++ = 0;
+        Trim(value);
+
+        int cls = TransportClassIndex(value);
+        if (cls < 0)
+        {
+            Logf("registry  \"%s\": unknown transport class \"%s\"", c->name, value);
+            return;
+        }
+        if (primary) c->primary = cls;
+
+        int n = rest ? ParseFloatList(rest, v, 4) : 0;
+        EmitClass(c, cls, v, n);
+
+        // The measured rule: 1 on every base-game resource whose primary class
+        // is COVERED, COOLER, NUCLEAR1 or NUCLEAR2, 0 on the other 42.
+        if (primary && !c->packedSet)
+            EmitB(c, RES_PACKED_OFF,
+                  (cls == 0 || cls == 5 || cls == 12 || cls == 13) ? 1 : 0);
+        return;
+    }
+    if (_stricmp(key, "kind") == 0)   { EmitI(c, RES_KIND_OFF, atoi(value)); return; }
+    if (_stricmp(key, "packed") == 0)
+    {
+        c->packedSet = true;
+        EmitB(c, RES_PACKED_OFF, _stricmp(value, "auto") == 0 ? 0 : atoi(value));
+        return;
+    }
+    if (_stricmp(key, "family") == 0)
+    {
+        int f = FamilyIndex(value);
+        if (f == -2) { Logf("registry  \"%s\": unknown family \"%s\"", c->name, value); return; }
+        EmitI(c, RES_FAMILY_OFF, f);
+        return;
+    }
+    if (_stricmp(key, "price") == 0 || _stricmp(key, "base_price") == 0)
+    {
+        // The same two numbers [price] and [base_price] take, but written into
+        // the record when it is built rather than around the engine's own pass.
+        // Those two sections are still the ones that survive a recompute.
+        float a = 0, b = 0;
+        if (!ParseMoneyPair(value, &a, &b)) return;
+        bool base = (key[0] == 'b' || key[0] == 'B');
+        EmitF(c, base ? RES_BASE_RUB : RES_PRICE_RUB, a);
+        EmitF(c, base ? RES_BASE_USD : RES_PRICE_USD, b);
+        return;
+    }
+    if (_stricmp(key, "trade_mult") == 0)
+    {
+        int n = ParseFloatList(value, v, 2);
+        if (n < 2) { Logf("registry  \"%s\": trade_mult needs <sell>, <buy>", c->name); return; }
+        EmitF(c, RES_MARKET_RUB + RES_MARKET_SELL, v[0]);
+        EmitF(c, RES_MARKET_RUB + RES_MARKET_BUY,  v[1]);
+        EmitF(c, RES_MARKET_USD + RES_MARKET_SELL, v[0]);
+        EmitF(c, RES_MARKET_USD + RES_MARKET_BUY,  v[1]);
+        return;
+    }
+    if (_stricmp(key, "market_rub") == 0 || _stricmp(key, "market_usd") == 0)
+    {
+        int n = ParseFloatList(value, v, 3);
+        if (n < 2)
+        {
+            Logf("registry  \"%s\": %s needs at least two figures", c->name, key);
+            return;
+        }
+        int m = (_stricmp(key, "market_rub") == 0) ? RES_MARKET_RUB : RES_MARKET_USD;
+        EmitF(c, m + RES_MARKET_LIM1, v[0]);
+        EmitF(c, m + RES_MARKET_LIM2, v[1]);
+        if (n > 2) EmitF(c, m + RES_MARKET_K, v[2]);
+        return;
+    }
+    if (_stricmp(key, "cargo") == 0)
+    {
+        c->cargo = _stricmp(value, "none") == 0 ? CARGO_NONE
+                 : _stricmp(value, "bulk") == 0 ? CARGO_BULK
+                 : _stricmp(value, "open") == 0 ? CARGO_OPEN
+                 : CARGO_AUTO;
+        if (c->cargo == CARGO_AUTO && _stricmp(value, "auto") != 0)
+            Logf("registry  \"%s\": cargo \"%s\" is not none/bulk/open/auto - "
+                 "taking it as auto", c->name, value);
+        return;
+    }
+    if (_stricmp(key, "field") == 0)
+    {
+        // The escape hatch, and the reason the unidentified fields need no
+        // invented names: `field = 0x50, f, 84` writes a float, `i` an int, `b`
+        // a byte, anywhere in the 832 bytes.
+        char* t = strchr(value, ',');
+        if (!t) { Logf("registry  \"%s\": field needs <offset>, f|i|b, <value>", c->name); return; }
+        *t++ = 0;
+        char* val = strchr(t, ',');
+        if (!val) { Logf("registry  \"%s\": field needs <offset>, f|i|b, <value>", c->name); return; }
+        *val++ = 0;
+        Trim(value); Trim(t); Trim(val);
+
+        int off = (int)strtol(value, NULL, 0);
+        if (t[0] == 'f' || t[0] == 'F') EmitF(c, off, (float)atof(val));
+        else if (t[0] == 'b' || t[0] == 'B') EmitB(c, off, (int)strtol(val, NULL, 0));
+        else EmitI(c, off, (int)strtol(val, NULL, 0));
+        return;
+    }
+
+    Logf("registry  \"%s\": unknown field \"%s\" - see plugins\\resources.ini", c->name, key);
+}
+
+// Everything a record needs that is not identity, assets or money: the shape of
+// a working resource with no class declared yet. Written before the entry's own
+// list, so any line in [custom:<name>] overrides it.
+//
+// The figures are the base game's commonest: the two market blocks of twelve
+// resources including every waste, a family of -1 (workers, eletric, heat,
+// water, usagewater), and the 0.3 at +0x310 that 55 of 57 records carry.
+static void WriteDefaultRecord(BYTE* rec)
+{
+    memset(rec, 0, RES_STRIDE);
+
+    *(int*)  (rec + RES_KIND_OFF)  = 0;
+    *(float*)(rec + RES_PRICE_RUB) = 10.0f;
+    *(float*)(rec + RES_PRICE_USD) = 10.0f;
+
+    static const int markets[2] = { RES_MARKET_RUB, RES_MARKET_USD };
+    static const float lim[2][2] = { { 200.0f, 350.0f }, { 500.0f, 500.0f } };
+    for (int b = 0; b < 2; b++)
+    {
+        BYTE* m = rec + markets[b];
+        *(float*)(m + RES_MARKET_SELL) = 0.95f;
+        *(float*)(m + RES_MARKET_BUY)  = 1.05f;
+        *(float*)(m + RES_MARKET_LIM1) = lim[b][0];
+        *(float*)(m + RES_MARKET_LIM2) = lim[b][1];
+        *(float*)(m + RES_MARKET_K)    = 0.5f;
+        *(float*)(m + RES_MARKET_ONE)  = 1.0f;
+    }
+
+    *(int*)  (rec + RES_FAMILY_OFF) = -1;
+    *(float*)(rec + RES_TAIL_OFF)   = 0.3f;
+}
+
+static void ApplyCustomWrites(BYTE* rec, CustomEntry* c)
+{
+    for (int i = 0; i < c->nWrites; i++)
+    {
+        ResWrite& w = c->w[i];
+        switch (w.kind)
+        {
+        case RW_F32: *(float*)(rec + w.off) = w.f; break;
+        case RW_I32: *(int*)  (rec + w.off) = w.i; break;
+        default:     *(rec + w.off) = (BYTE)w.i;   break;
+        }
+    }
+}
+
+// What the record actually says, after everything has been applied - the one
+// thing that answers "did my .ini reach the engine". Only the fields the base
+// game ever writes are printed, because the rest are zero by construction.
+static void ReportRecord(BYTE* rec, const char* name)
+{
+    Logf("record    \"%s\" kind %d  price %.2f/%.2f  base %.2f/%.2f  packed %d  "
+         "family %d  +310 %.2f", name,
+         *(int*)(rec + RES_KIND_OFF),
+         *(float*)(rec + RES_PRICE_RUB), *(float*)(rec + RES_PRICE_USD),
+         *(float*)(rec + RES_BASE_RUB),  *(float*)(rec + RES_BASE_USD),
+         *(rec + RES_PACKED_OFF), *(int*)(rec + RES_FAMILY_OFF),
+         *(float*)(rec + RES_TAIL_OFF));
+
+    for (int b = 0; b < 2; b++)
+    {
+        BYTE* m = rec + (b ? RES_MARKET_USD : RES_MARKET_RUB);
+        Logf("record    \"%s\" market %s  sell %.2f buy %.2f  %.0f / %.0f  k %.2f",
+             name, b ? "usd" : "rub",
+             *(float*)(m + RES_MARKET_SELL), *(float*)(m + RES_MARKET_BUY),
+             *(float*)(m + RES_MARKET_LIM1), *(float*)(m + RES_MARKET_LIM2),
+             *(float*)(m + RES_MARKET_K));
+    }
+
+    int classes = 0;
+    for (int k = 0; k < RES_CLASS_COUNT; k++)
+    {
+        BYTE* cb = rec + RES_CLASS_BASE + k * RES_CLASS_STRIDE;
+        if (*(float*)cb == 0.0f) continue;
+        classes++;
+        Logf("record    \"%s\" class %-9s [%2d] factor %.3f  %.2f / %.2f  %.2f / %.2f  flag %d",
+             name, kTransportClasses[k].name, k,
+             *(float*)cb, *(float*)(cb + RES_CLASS_F1), *(float*)(cb + RES_CLASS_F2),
+             *(float*)(cb + RES_CLASS_F3), *(float*)(cb + RES_CLASS_F4),
+             *(cb + RES_CLASS_FLAG));
+    }
+    if (!classes)
+        Logf("record    WARN  \"%s\" can be carried by no transport class at all - every "
+             "storage that names it will report 0.00 of 0.00 t. Set `transport =` in "
+             "[custom:%s]", name, name);
+}
+
 // Parsed by hand rather than through the profile API: display names are UTF-8
 // and GetPrivateProfileString would mangle anything outside the ANSI codepage.
 static void LoadResourceRegistry()
@@ -373,27 +921,51 @@ static void LoadResourceRegistry()
     CloseHandle(h);
     buf[got] = 0;
 
-    enum { SECT_NONE, SECT_LIST, SECT_BASE, SECT_PRICE };
+    enum { SECT_NONE, SECT_LIST, SECT_BASE, SECT_PRICE, SECT_CUSTOM };
 
-    int   inSection = SECT_NONE;
-    char* ctx = NULL;
+    int          inSection = SECT_NONE;
+    CustomEntry* custom    = NULL;
+    char*        ctx = NULL;
     for (char* line = strtok_s(buf, "\n", &ctx); line; line = strtok_s(NULL, "\n", &ctx))
     {
         Trim(line);
         if (!line[0] || line[0] == ';' || line[0] == '#') continue;
-        // [list] is the content, [base_price] and [price] are its money, and
+        // [list] is the content, [base_price] and [price] are its money,
+        // [custom:<name>] is one resource's record field by field, and
         // [resources] is the plugin's own settings; they share a file so a
         // feature is one file. Any other section is somebody else's and is
         // skipped.
         if (line[0] == '[')
         {
-            inSection = _strnicmp(line, "[list]", 6)       == 0 ? SECT_LIST
+            custom    = NULL;
+            inSection = _strnicmp(line, "[list]", 6)        == 0 ? SECT_LIST
                       : _strnicmp(line, "[base_price]", 12) == 0 ? SECT_BASE
                       : _strnicmp(line, "[price]", 7)       == 0 ? SECT_PRICE
                       : SECT_NONE;
+
+            if (inSection == SECT_NONE && _strnicmp(line, "[custom:", 8) == 0)
+            {
+                char who[64];
+                strncpy_s(who, sizeof(who), line + 8, _TRUNCATE);
+                if (char* end = strchr(who, ']')) *end = 0;
+                Trim(who);
+
+                custom = who[0] ? CustomFor(who) : NULL;
+                if (custom) inSection = SECT_CUSTOM;
+                else Logf("registry  \"%s\" - no room for another [custom:] section", who);
+            }
             continue;
         }
         if (inSection == SECT_NONE) continue;
+
+        if (inSection == SECT_CUSTOM)
+        {
+            char* eq = strchr(line, '=');
+            if (!eq) continue;
+            *eq = 0;
+            ParseCustomLine(custom, line, eq + 1);
+            continue;
+        }
 
         if (inSection != SECT_LIST)
         {
@@ -455,7 +1027,7 @@ static void LoadResourceRegistry()
         Trim(line);
         strncpy_s(e.name, sizeof(e.name), line, _TRUNCATE);
 
-        // [<slot>,]<template>[,<display name>]
+        // [<slot>,]<template|custom>[,<display name>]
         //
         // The slot is optional, and leaving it out is the better default:
         // hard-coding 57 and 58 only holds as long as nothing else claims them
@@ -463,6 +1035,11 @@ static void LoadResourceRegistry()
         // mod should have to know. A leading field that is not a number means
         // the value starts at the template, which is what makes the short form
         // unambiguous without a second syntax.
+        //
+        // `custom` (or `none`) in the template field means there is no donor at
+        // all: the record is built from zero out of [custom:<name>]. The two
+        // forms are the same syntax and the same registry - only what happens at
+        // arm time differs.
         char* value = eq + 1;
         Trim(value);
         e.index = -1;                                   // auto until told otherwise
@@ -487,8 +1064,24 @@ static void LoadResourceRegistry()
             Trim(value);
             if (value[0])
             {
-                e.tmplIndex = CanonicalIndex(value);
-                if (e.tmplIndex < 0) Logf("registry  \"%s\": unknown template \"%s\"", e.name, value);
+                if (_stricmp(value, "custom") == 0 || _stricmp(value, "none") == 0)
+                    e.custom = true;
+                else
+                {
+                    e.tmplIndex = CanonicalIndex(value);
+                    // A misspelt template used to leave the record all zeroes
+                    // and the resource inert, with one line in the log. Building
+                    // it from scratch is strictly better - it is at least a
+                    // working record - and keeps the resource count, which the
+                    // save format depends on, exactly as it was.
+                    if (e.tmplIndex < 0)
+                    {
+                        e.custom = true;
+                        Logf("registry  \"%s\": \"%s\" is not a base-game resource - building the "
+                             "record from scratch. Say `custom` if that was the intent",
+                             e.name, value);
+                    }
+                }
             }
             if (caption)
             {
@@ -502,12 +1095,30 @@ static void LoadResourceRegistry()
             }
         }
 
+        // No template, however the line said so, means built from scratch.
+        if (e.tmplIndex < 0) e.custom = true;
+
+        // A clone inherits the template's caption id, which is why one is
+        // optional there. A record built from zero has 0 in that field and would
+        // resolve to whatever string id 0 is, so it gets an id of its own and
+        // its own name as the display text.
+        if (e.custom && !e.textId)
+        {
+            MultiByteToWideChar(CP_UTF8, 0, e.name, -1, e.display,
+                                sizeof(e.display) / sizeof(e.display[0]));
+            e.textId = TML_TEXT_ID_BASE + g_regCount;
+        }
+
+        char how[48];
+        if (e.custom) strncpy_s(how, sizeof(how), "no template", _TRUNCATE);
+        else _snprintf_s(how, sizeof(how), _TRUNCATE, "template %d", e.tmplIndex);
+
         if (e.index < 0)
-            Logf("registry  \"%s\" -> next free slot, template %d, text id %d",
-                 e.name, e.tmplIndex, e.textId);
+            Logf("registry  \"%s\" -> next free slot, %s, text id %d",
+                 e.name, how, e.textId);
         else
-            Logf("registry  \"%s\" -> slot %d, template %d, text id %d",
-                 e.name, e.index, e.tmplIndex, e.textId);
+            Logf("registry  \"%s\" -> slot %d, %s, text id %d",
+                 e.name, e.index, how, e.textId);
         g_regCount++;
     }
     free(buf);
@@ -760,64 +1371,101 @@ static void* LoadResourceMesh(const char* nmf, const char* mtl)
     return mesh;
 }
 
-// Replaces the template's mesh pointers with meshes loaded from this resource's
-// own files. **The template still decides the shape**: a record whose stage
-// slots are null is open-transport and has one mesh named <name>.nmf, one whose
-// stage slots are filled is bulk and has four stages plus <name>_vehicle.nmf.
-// Reading that off the clone rather than off a config keeps the rule in one
-// place - the same place that already decides the transport class.
-//
-// A slot whose file is missing keeps the template's mesh, which is wrong-looking
-// but drawable; the alternative is a null the engine dereferences.
-static void AttachResourceMeshes(BYTE* rec, const char* name)
+// Which of the three cargo shapes a resource has, from the files that are
+// actually on disk. This is what a record with no template has to use, because a
+// zeroed record cannot be asked - and it is the same rule the stock folder
+// follows: bulk resources ship <name>1..4.nmf plus <name>_vehicle.nmf, open ones
+// exactly <name>.nmf, and the fifteen that travel packed ship no mesh at all.
+static int CargoShapeFromFiles(const char* name)
 {
-    bool bulk = false, open = false;
-    for (int i = 0; i < RES_MESH_STAGES; i++)
-        if (*(void**)(rec + RES_MESH_STAGE1 + i * 8)) bulk = true;
+    char p[MAX_PATH];
 
+    // Without the engine's existence helper AssetExists answers yes to
+    // everything, which would make this pick `bulk` for a resource with no files
+    // at all - and handing CreateManagedMesh a path that is not there is the one
+    // mistake that kills the process a whole world load later. No answer is the
+    // only safe answer; say `cargo = bulk` explicitly if that is really wanted.
+    if (!o_FileExists)
+    {
+        Logf("resource  \"%s\": no way to test for cargo files - assuming none. Say "
+             "`cargo =` in [custom:%s] to override", name, name);
+        return CARGO_NONE;
+    }
+
+    _snprintf_s(p, sizeof(p), _TRUNCATE, "resources/%s1.nmf", name);
+    if (AssetExists(p)) return CARGO_BULK;
+
+    _snprintf_s(p, sizeof(p), _TRUNCATE, "resources/%s.nmf", name);
+    if (AssetExists(p)) return CARGO_OPEN;
+
+    return CARGO_NONE;
+}
+
+// The template's own mesh slots: stages filled means bulk, only the vehicle slot
+// means open, all five null means the template has no cargo geometry either.
+static int CargoShapeFromRecord(BYTE* rec)
+{
+    for (int i = 0; i < RES_MESH_STAGES; i++)
+        if (*(void**)(rec + RES_MESH_STAGE1 + i * 8)) return CARGO_BULK;
+    return *(void**)(rec + RES_MESH_VEHICLE) ? CARGO_OPEN : CARGO_NONE;
+}
+
+// Gives the record cargo meshes loaded from this resource's own files.
+//
+// **The shape is decided by the caller**, and how depends on where the record
+// came from: a clone reads it off the template's mesh slots, which is what keeps
+// the rule in the same place that decides the transport class, and a
+// from-scratch record reads it off the files on disk. Either can be overridden
+// with `cargo =` in [custom:<name>].
+//
+// For a clone, a slot whose file is missing keeps the template's mesh - wrong
+// looking but drawable, where the alternative is a null the engine dereferences.
+// For a from-scratch record there is nothing to fall back to, so a bulk shape
+// with a missing stage leaves that stage null, exactly as the base game's own
+// packed resources do for all five.
+static void AttachResourceMeshes(BYTE* rec, const char* name, int shape)
+{
     char mtl[MAX_PATH], nmf[MAX_PATH];
     _snprintf_s(mtl, sizeof(mtl), _TRUNCATE, "resources/%s.mtl", name);
 
-    int done = 0;
-    if (bulk)
+    int done = 0, want = 0;
+    if (shape == CARGO_BULK)
     {
+        want = 1 + RES_MESH_STAGES;
         _snprintf_s(nmf, sizeof(nmf), _TRUNCATE, "resources/%s_vehicle.nmf", name);
         if (void* m = LoadResourceMesh(nmf, mtl)) { *(void**)(rec + RES_MESH_VEHICLE) = m; done++; }
 
         for (int i = 0; i < RES_MESH_STAGES; i++)
         {
             BYTE* slot = rec + RES_MESH_STAGE1 + i * 8;
-            if (!*(void**)slot) continue;             // template has no such stage
             _snprintf_s(nmf, sizeof(nmf), _TRUNCATE, "resources/%s%d.nmf", name, i + 1);
             if (void* m = LoadResourceMesh(nmf, mtl)) { *(void**)slot = m; done++; }
         }
     }
-    else if (*(void**)(rec + RES_MESH_VEHICLE))
+    else if (shape == CARGO_OPEN)
     {
-        open = true;
+        want = 1;
         _snprintf_s(nmf, sizeof(nmf), _TRUNCATE, "resources/%s.nmf", name);
         if (void* m = LoadResourceMesh(nmf, mtl)) { *(void**)(rec + RES_MESH_VEHICLE) = m; done++; }
     }
 
-    // A template with all five slots null has no cargo geometry of its own -
-    // food, clothes, eletronics and everything else that travels covered are
-    // like that, and only their icon is ever drawn. A clone of one of those is
-    // finished the moment it has an icon, so this is not something to warn
-    // about; the warning is for a template that *did* have meshes and files
-    // that are not there to replace them.
-    if (!bulk && !open)
+    // No cargo geometry at all is a perfectly ordinary resource - food, clothes,
+    // eletronics and the other twelve that travel packed are like that, and only
+    // their icon is ever drawn. So this is not a warning; the warning is a shape
+    // that was asked for and has no files behind it.
+    if (shape == CARGO_NONE)
     {
-        Logf("resource  \"%s\" has no cargo geometry, like its template - "
-             "media_soviet/resources/%s.png is the only asset it needs", name, name);
+        Logf("resource  \"%s\" has no cargo geometry - media_soviet/resources/%s.png is "
+             "the only asset it needs", name, name);
         return;
     }
 
-    Logf("resource  \"%s\" cargo meshes: %d of %s replaced", name, done,
-         bulk ? "5 (bulk)" : "1 (open)");
+    Logf("resource  \"%s\" cargo meshes: %d of %d (%s)", name, done, want,
+         shape == CARGO_BULK ? "bulk" : "open");
     if (done == 0)
         Logf("resource  WARN  \"%s\" has no cargo geometry under media_soviet/resources - "
-             "it will be drawn as its template. Add %s.nmf and %s.mtl, or drop it from [list]",
-             name, name, name);
+             "add %s.nmf and %s.mtl, or say `cargo = none` in [custom:%s]",
+             name, name, name, name);
 }
 
 // How many records the array has to hold for everything in [list] to fit.
@@ -1041,29 +1689,72 @@ static void EnsureArmed()
             continue;
         }
 
-        // A freshly claimed record is all zeroes, so copy a working resource in
-        // first; only then overwrite the identity fields.
-        if (e.tmplIndex >= 0)
+        CustomEntry* cfg = CustomLookup(e.name);
+
+        // Two ways to fill a freshly claimed record, and it is all zeroes to
+        // begin with either way.
+        //
+        // **Clone** - copy a working resource in and correct it. What the
+        // template really supplies is the 30 bytes of content the engine's own
+        // resource table writes: the transport classes, the two market blocks,
+        // the kind, the family. Nothing else in the record is per-resource.
+        //
+        // **From scratch** - write those same 30 bytes ourselves. Every offset
+        // below is relative to a name at +0x00, which is the one thing the layout
+        // is anchored on, so a record built here is refused outright if the name
+        // field turned up anywhere else.
+        if (e.custom)
+        {
+            if (g_nameOff != 0)
+            {
+                Logf("resource  \"%s\": the name field is at +0x%X, not +0, so the record "
+                     "layout is not the one this build knows - refusing to build it from "
+                     "scratch", e.name, g_nameOff);
+                VirtualProtect(rec, RES_STRIDE, prot, &prot);
+                continue;
+            }
+            WriteDefaultRecord(rec);
+        }
+        else
             memcpy(rec, base + (size_t)e.tmplIndex * RES_STRIDE, RES_STRIDE);
 
+        // The entry's own field list, which a clone may also have - one line of
+        // [custom:<name>] over a cloned record is how a template is corrected
+        // rather than replaced.
+        if (cfg) ApplyCustomWrites(rec, cfg);
+
+        // Identity last, so no `field =` line can reach the name or the caption.
         memset(rec + g_nameOff, 0, 32);
         strncpy_s((char*)(rec + g_nameOff), 32, e.name, _TRUNCATE);
         if (e.textId) *(int*)(rec + RES_TEXTID_OFF) = e.textId;
+
+        int shape = cfg ? cfg->cargo : CARGO_AUTO;
+        if (shape == CARGO_AUTO)
+            shape = e.custom ? CargoShapeFromFiles(e.name) : CargoShapeFromRecord(rec);
 
         // Done while the record is still writable, and before the vector's end
         // moves - nothing may see this record until it is complete. The engine
         // is called into here, so a fault has to stay ours rather than take the
         // process down with a half-published resource.
-        __try { AttachResourceMeshes(rec, e.name); }
+        __try { AttachResourceMeshes(rec, e.name, shape); }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
-            Logf("resource  \"%s\": cargo mesh load faulted - keeping the template's", e.name);
+            Logf("resource  \"%s\": cargo mesh load faulted - the cargo slots keep whatever "
+                 "they had", e.name);
         }
 
         // The icon is the one asset the engine finds by name, in a UI pass of
         // its own at 0x2960DE, and the one this plugin therefore cannot supply
         // a fallback for. Saying so here is worth a line: a resource with no
         // icon looks like a resource that did not publish.
+        //
+        // **It is not optional on a record built from scratch.** A clone
+        // inherits the template's texture pointer at +0x48 and is merely drawn
+        // wrongly without a .png of its own; a from-scratch record has null
+        // there until that pass runs. The pass overwrites +0x48 for every record
+        // in the vector without releasing what was there - `mov [rbx+0x48],rax`
+        // at 0x296172 - so the pointer is not owned by the record and seeding it
+        // from record 0 costs nothing and removes the null.
         {
             char png[MAX_PATH];
             _snprintf_s(png, sizeof(png), _TRUNCATE, "resources/%s.png", e.name);
@@ -1071,6 +1762,9 @@ static void EnsureArmed()
                 Logf("resource  WARN  \"%s\" has no icon - put a 48x48 RGBA PNG at "
                      "media_soviet/%s (tesmioloader\\vfs\\media_soviet\\resources\\%s.png)",
                      e.name, png, e.name);
+
+            if (e.custom && !*(void**)(rec + RES_ICON_OFF))
+                *(void**)(rec + RES_ICON_OFF) = *(void**)(base + RES_ICON_OFF);
         }
 
         VirtualProtect(rec, RES_STRIDE, prot, &prot);
@@ -1086,8 +1780,21 @@ static void EnsureArmed()
 
         e.armed    = true;
         e.resolved = want;
-        Logf("resource  \"%s\" published as index %d (template %d, caption %d), vector now %d",
-             e.name, want, e.tmplIndex, e.textId, want + 1);
+        if (e.custom)
+            Logf("resource  \"%s\" published as index %d (built from scratch%s, caption %d), "
+                 "vector now %d", e.name, want, cfg ? "" : " with NO [custom:] section",
+                 e.textId, want + 1);
+        else
+            Logf("resource  \"%s\" published as index %d (template %d%s, caption %d), "
+                 "vector now %d", e.name, want, e.tmplIndex,
+                 cfg ? " + [custom:] overrides" : "", e.textId, want + 1);
+
+        // Every field of the record as it actually stands, which is the only
+        // thing that separates "the .ini did not reach the engine" from "the
+        // engine does not do what the field was thought to do". Always for a
+        // record with no template - there is no donor to compare it against -
+        // and on request for a clone.
+        if (e.custom || g_customReport) ReportRecord(rec, e.name);
     }
 }
 
@@ -1364,7 +2071,7 @@ static wchar_t* h_GetString(void* self, int id)
 //                 second, shared function afterwards; neither matters here -
 //                 a post-hook only needs it called once per customhouse per
 //                 tick, which the dispatcher already guarantees.
-#define P_CUSTOMHOUSE_TICK_RVA 0x185470
+#define P_CUSTOMHOUSE_TICK_RVA 0x1854E0   // v1.1.1.9; was 0x185470
 
 static const BYTE kCustomsTickPrologue[] = {
     0x48, 0x8B, 0xC4,                            // mov  rax,rsp
@@ -1382,9 +2089,11 @@ static const BYTE kCustomsTickPrologue[] = {
 #define ST_CLASS           0x90
 #define SLOT_SIZE          0x10
 
-#define RES_CLASS_FACTOR   0xCC       // + class * 0x20
-#define RES_CLASS_BLOCKED  0xE8       // + class * 0x20
-#define RES_CLASS_STRIDE   0x20
+// RES_CLASS_FACTOR, RES_CLASS_BLOCKED and RES_CLASS_STRIDE are the record's own
+// transport-class layout and are declared with the rest of it at the top of this
+// file. Both readings are the same two fields of the same 0x20-byte block: the
+// capacity factor the storage code multiplies by, and the flag this walk treats
+// as "not tradeable in this class".
 
 struct Slot { void* res; float content; float limit; };
 
@@ -1568,6 +2277,13 @@ static int         svc_IndexOf(const char* n)
 }
 static const TsmResourceApi kResourceApi = { svc_Count, svc_Name, svc_Index, svc_IndexOf };
 
+extern "C" int SmlResourcesDeclaredCount(void) { return g_regCount; }
+extern "C" int SmlResourcesHookReady(void) { return g_smlResourceHookReady ? 1 : 0; }
+extern "C" const char* SmlResourcesDeclaredName(int i)
+{
+    return (i >= 0 && i < g_regCount) ? g_reg[i].name : NULL;
+}
+
 extern "C" unsigned TsmPluginApiVersion(void)
 {
     return TSM_API_VERSION;
@@ -1578,6 +2294,7 @@ extern "C" int TsmPluginInit(const TsmHost* host, TsmPluginInfo* info)
     TsmBind(host);
     info->name    = "resources";
     info->version = "1.7";
+    g_smlResourceHookReady = false;
 
     const char* ini = "plugins\\resources.ini";
     char v[64];
@@ -1599,8 +2316,9 @@ extern "C" int TsmPluginInit(const TsmHost* host, TsmPluginInfo* info)
     if (H->configString(ini, "resources", "resource_capacity", v, sizeof(v), "") && v[0])
         g_wantCapacity = (int)strtol(v, NULL, 0);
 
-    g_priceHook   = H->configInt(ini, "resources", "price_hook", g_priceHook);
-    g_priceReport = H->configInt(ini, "resources", "price_report", g_priceReport);
+    g_priceHook    = H->configInt(ini, "resources", "price_hook", g_priceHook);
+    g_priceReport  = H->configInt(ini, "resources", "price_report", g_priceReport);
+    g_customReport = H->configInt(ini, "resources", "custom_report", g_customReport);
     if (H->configString(ini, "resources", "price_pass_rva", v, sizeof(v), "") && v[0])
         g_priceRva = (DWORD)strtoul(v, NULL, 0);
 
@@ -1614,12 +2332,6 @@ extern "C" int TsmPluginInit(const TsmHost* host, TsmPluginInfo* info)
     WriteTo(g_hRes, hdr, (int)strlen(hdr));
 
     if (g_resHook >= 2) LoadResourceRegistry();
-
-    // Captions for mod resources. Every string in the game comes through here,
-    // so it is hooked whatever mode we are in - the ids we mint are answered
-    // locally and nothing else is touched.
-    PatchIat(g_exe, DLL_ENGINE, SYM_GET_STRING, (void*)h_GetString,
-             (void**)&o_GetString, "C3D_LANGUAGE::GetString");
 
     // Not hooks - the addresses are taken so mod resources can be given cargo
     // meshes of their own, the same three calls the engine's table makes.
@@ -1637,6 +2349,19 @@ extern "C" int TsmPluginInit(const TsmHost* host, TsmPluginInfo* info)
                            (void**)&o_ResourceGet, kResourceGetPrologue,
                            STOLEN_BYTES, "ResourceGet"))
         return 1;
+    g_smlResourceHookReady = g_resHook >= 2;
+
+    // Captions for mod resources. Every string in the game comes through here,
+    // so it is hooked whatever mode we are in - the ids we mint are answered
+    // locally and nothing else is touched. Installed only now, after
+    // ResourceGet is confirmed: LoadOnePlugin's contract is that a plugin
+    // returning non-zero from Init has hooked nothing, because it then calls
+    // FreeLibrary on this DLL - a GetString hook installed before the
+    // ResourceGet refusal above would have pointed the game's import slot at
+    // code that had just been unmapped, and the next menu string would have
+    // jumped into freed memory instead of crashing cleanly.
+    PatchIat(g_exe, DLL_ENGINE, SYM_GET_STRING, (void*)h_GetString,
+             (void**)&o_GetString, "C3D_LANGUAGE::GetString");
 
     // The price bracket. Installed whenever there is something to say - an
     // override to apply or a table to print - and skipped entirely otherwise,
@@ -1681,6 +2406,11 @@ extern "C" int TsmPluginInit(const TsmHost* host, TsmPluginInfo* info)
     }
     else
         Logf("customs   hook = 0 - customhouses trade only what they were built with");
+
+    int nCustom = 0;
+    for (int i = 0; i < g_regCount; i++) if (g_reg[i].custom) nCustom++;
+    Logf("resource  %d name(s) declared: %d cloned from a template, %d built from scratch, "
+         "%d [custom:] section(s) read", g_regCount, g_regCount - nCustom, nCustom, g_customCount);
 
     Logf("resource  hook mode=%d rva=0x%lX, %d name(s) declared, array %s",
          g_resHook, g_resRva, g_regCount,

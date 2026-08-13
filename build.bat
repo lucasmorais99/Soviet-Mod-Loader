@@ -12,7 +12,7 @@ cd /d "%~dp0"
 if not exist build\plugins mkdir build\plugins
 if not exist build\obj mkdir build\obj
 set COMMON=/nologo /O2 /MT /W4 /EHsc /std:c++17 /Iinclude /c
-cl %COMMON% /Fo"build\obj\sml_main.obj" plugins\000_soviet_mod_loader\000_soviet_mod_loader.cpp
+cl %COMMON% /Fo"build\obj\sml_main.obj" plugins\soviet_mod_loader\soviet_mod_loader.cpp
 if errorlevel 1 exit /b 1
 cl %COMMON% /DTsmPluginApiVersion=SmlBuildingsApiVersion /DTsmPluginInit=SmlBuildingsInit /DDllMain=SmlBuildingsDllMain /Fo"build\obj\buildings.obj" vendor\tesmio\buildings.cpp
 if errorlevel 1 exit /b 1
@@ -22,10 +22,15 @@ cl %COMMON% /DTsmPluginApiVersion=SmlDepositsApiVersion /DTsmPluginInit=SmlDepos
 if errorlevel 1 exit /b 1
 cl %COMMON% /DTsmPluginApiVersion=SmlNeedsApiVersion /DTsmPluginInit=SmlNeedsInit /DTsmPluginStart=SmlNeedsStart /DDllMain=SmlNeedsDllMain /Fo"build\obj\needs.obj" vendor\tesmio\needs.cpp
 if errorlevel 1 exit /b 1
-link /nologo /DLL /OUT:"build\plugins\000_soviet_mod_loader.dll" ^
+if exist build\plugins\000_soviet_mod_loader.dll del build\plugins\000_soviet_mod_loader.dll
+if exist build\plugins\000_soviet_mod_loader.ini del build\plugins\000_soviet_mod_loader.ini
+if exist build\plugins\000_soviet_mod_loader.exp del build\plugins\000_soviet_mod_loader.exp
+if exist build\plugins\000_soviet_mod_loader.lib del build\plugins\000_soviet_mod_loader.lib
+if exist build\plugins\000_soviet_mod_loader.obj del build\plugins\000_soviet_mod_loader.obj
+link /nologo /DLL /OUT:"build\plugins\soviet_mod_loader.dll" ^
   build\obj\sml_main.obj build\obj\buildings.obj build\obj\resources.obj ^
   build\obj\deposits.obj build\obj\needs.obj kernel32.lib advapi32.lib user32.lib
 if errorlevel 1 exit /b 1
-copy /y plugins\000_soviet_mod_loader\000_soviet_mod_loader.ini build\plugins\000_soviet_mod_loader.ini >nul
-echo [build] ok -^> build\plugins\000_soviet_mod_loader.dll
+copy /y plugins\soviet_mod_loader\soviet_mod_loader.ini build\plugins\soviet_mod_loader.ini >nul
+echo [build] ok -^> build\plugins\soviet_mod_loader.dll
 endlocal

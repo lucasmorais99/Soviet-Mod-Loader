@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <cmath>
 #include <ctime>
 #include <cstring>
 #include <cstdio>
@@ -42,10 +43,20 @@ extern "C" unsigned SmlResourcesApiVersion(void);
 extern "C" int SmlResourcesInit(const TsmHost*, TsmPluginInfo*);
 extern "C" unsigned SmlDepositsApiVersion(void);
 extern "C" int SmlDepositsInit(const TsmHost*, TsmPluginInfo*);
-extern "C" void SmlDepositsSetVfsRoot(const char*);
 extern "C" unsigned SmlNeedsApiVersion(void);
 extern "C" int SmlNeedsInit(const TsmHost*, TsmPluginInfo*);
 extern "C" int SmlNeedsStart(void);
+extern "C" int SmlResourcesDeclaredCount(void);
+extern "C" const char* SmlResourcesDeclaredName(int);
+extern "C" int SmlResourcesHookReady(void);
+extern "C" int SmlDepositsDeclaredCount(void);
+extern "C" int SmlDepositsPatchReady(void);
+extern "C" int SmlDepositsMapsReady(void);
+extern "C" int SmlNeedsDeclaredCount(void);
+extern "C" int SmlNeedsHooksReady(void);
+extern "C" int SmlBuildingsEnabledCount(void);
+extern "C" int SmlBuildingsCompleteCount(void);
+extern "C" int SmlBuildingsIncompleteCount(void);
 
 static std::string Lower(std::string s) {
     for (char& c : s) c = (char)std::tolower((unsigned char)c);
@@ -447,6 +458,46 @@ struct DomainPlan {
     bool writeBaseline = false;
 };
 static std::vector<DomainPlan> g_domainPlans;
+static std::vector<std::string> g_validationErrors;
+static std::string g_pendingConfirmationIndex;
+static bool g_applicationReady;
+
+static size_t ContentCount(const Ini& ini, const std::string& settings, bool listDomain) {
+    if (listDomain) {
+        const Section* list = ini.find("list");
+        return list ? list->entries.size() : 0;
+    }
+    size_t count = 0;
+    for (const auto& section : ini.sections)
+        if (Lower(section.name) != Lower(settings) &&
+            IsTrue(ini.get(section.name, "enabled", "1"), true)) count++;
+    return count;
+}
+
+static void ApplyEmbeddedInvariants(const std::string& domain, Ini& ini) {
+    if (domain == "resources" && ContentCount(ini, "resources", true)) {
+        SetEntry(*EnsureSection(ini, "resources"), "hook", "2");
+        H->log("sml       invariant resources.hook=2 (%d planned resource(s))",
+               (int)ContentCount(ini, "resources", true));
+    } else if (domain == "deposits" && ContentCount(ini, "deposits", false)) {
+        SetEntry(*EnsureSection(ini, "deposits"), "code_patch", "1");
+        H->log("sml       invariant deposits.code_patch=1 (%d planned deposit(s))",
+               (int)ContentCount(ini, "deposits", false));
+    } else if (domain == "needs" && ContentCount(ini, "needs", true)) {
+        Section* settings = EnsureSection(ini, "needs");
+        SetEntry(*settings, "enabled", "1");
+        SetEntry(*settings, "demand", "1");
+        SetEntry(*settings, "storage", "1");
+        H->log("sml       invariants needs.enabled/demand/storage=1 (%d planned need(s))",
+               (int)ContentCount(ini, "needs", true));
+    } else if (domain == "buildings" && ContentCount(ini, "buildings", false)) {
+        Section* settings = EnsureSection(ini, "buildings");
+        SetEntry(*settings, "enabled", "1");
+        SetEntry(*settings, "out", "media_soviet\\workshop_wip");
+        H->log("sml       invariants buildings.enabled=1, out=media_soviet\\workshop_wip (%d planned building(s))",
+               (int)ContentCount(ini, "buildings", false));
+    }
+}
 
 static void PlanDomain(const std::string& domain) {
     fs::path target = g_base / "plugins" / fs::u8path(domain + ".ini");
@@ -505,7 +556,126 @@ static void PlanDomain(const std::string& domain) {
     }
     if (domain == "resources") StabilizeListOrder(merged, "list", "resource_order");
     if (domain == "needs") StabilizeListOrder(merged, "list", "need_order");
+    ApplyEmbeddedInvariants(domain, merged);
     g_domainPlans.push_back({domain, target, baseline, baselineText, SerializeIni(merged), writeBaseline});
+}
+
+static const DomainPlan* PlannedDomain(const char* domain) {
+    for (const auto& plan : g_domainPlans) if (plan.domain == domain) return &plan;
+    return nullptr;
+}
+
+static bool LoadPlannedDomain(const char* domain, Ini& out) {
+    const DomainPlan* plan = PlannedDomain(domain); std::string error;
+    return plan && ParseIniText(plan->mergedText, out, error);
+}
+
+static std::set<std::string> KnownResources(const Ini& resources) {
+    static const char* vanilla[] = {
+        "workers","eletric","vehicles","trains","heat","gravel","rawgravel","plants","steel",
+        "aluminium","prefabpanels","bricks","wood","oil","chemicals","coal","rawcoal","iron",
+        "rawiron","bauxite","rawbauxite","bitumen","boards","uranium","yellowcake","uf6",
+        "nuclearfuel","nuclearfuelburned","fuel","fabric","alcohol","cement","alumina","food",
+        "clothes","meat","livestock","asphalt","concrete","ecomponents","mcomponents","plastics",
+        "eletronics","explosives","water","usagewater","fertiliser_liquid","waste_gravel",
+        "waste_steel","waste_aluminium","waste_plastic","waste_bio","fertiliser","waste_burnable",
+        "waste_toxic","waste_other","waste_ash","waste_mixed","service_material"
+    };
+    std::set<std::string> known;
+    for (const char* name : vanilla) known.insert(name);
+    if (const Section* list = resources.find("list"))
+        for (const auto& entry : list->entries) known.insert(Lower(entry.key));
+    return known;
+}
+
+static std::vector<std::string> Words(const std::string& value) {
+    std::istringstream in(value); std::vector<std::string> words; std::string word;
+    while (in >> word) words.push_back(word);
+    return words;
+}
+
+static bool LooksNumeric(const std::string& value) {
+    if (value.empty()) return false; char* end = nullptr;
+    std::strtod(value.c_str(), &end); return end && *end == 0;
+}
+
+static bool ParseRichnessOffset(const std::string& value, double* result = nullptr) {
+    std::string text = Trim(value);
+    if (text.empty()) return false;
+    char* end = nullptr;
+    double parsed = std::strtod(text.c_str(), &end);
+    if (!end || *end != 0 || !std::isfinite(parsed) || parsed < -0.25 || parsed > 0.25)
+        return false;
+    if (result) *result = parsed;
+    return true;
+}
+
+static void RequireResource(const std::set<std::string>& known, const std::string& name,
+                            const std::string& owner) {
+    std::string key = Lower(Trim(name));
+    if (!key.empty() && !known.count(key))
+        g_validationErrors.push_back(owner + " references a missing resource: " + name);
+}
+
+static fs::path GameRoot() {
+    wchar_t exe[MAX_PATH] = {};
+    if (H && H->exeModule && GetModuleFileNameW((HMODULE)H->exeModule, exe, MAX_PATH))
+        return fs::path(exe).parent_path();
+    return g_base.parent_path();
+}
+
+static bool ValidatePlannedContent() {
+    g_validationErrors.clear(); Ini resources, deposits, needs, buildings;
+    if (!LoadPlannedDomain("resources", resources) || !LoadPlannedDomain("deposits", deposits) ||
+        !LoadPlannedDomain("needs", needs) || !LoadPlannedDomain("buildings", buildings)) {
+        g_validationErrors.push_back("unable to parse the consolidated INI files"); return false;
+    }
+    std::set<std::string> known = KnownResources(resources);
+
+    if (const Section* list = resources.find("list")) for (const auto& entry : list->entries) {
+        std::string value = entry.value; size_t comma = value.find(',');
+        std::string donor = Trim(value.substr(0, comma));
+        if (!donor.empty() && Lower(donor) != "custom" && !LooksNumeric(donor))
+            RequireResource(known, donor, "resource [" + entry.key + "]");
+    }
+    for (const auto& section : deposits.sections) if (Lower(section.name) != "deposits") {
+        std::string icon = deposits.get(section.name, "icon");
+        if (!icon.empty()) RequireResource(known, icon, "deposit [" + section.name + "]");
+        std::string offset = deposits.get(section.name, "richness_offset");
+        if (!offset.empty() && !ParseRichnessOffset(offset))
+            g_validationErrors.push_back("deposit [" + section.name +
+                "] richness_offset must be a finite number from -0.25 to +0.25: " + offset);
+    }
+    if (const Section* list = needs.find("list")) for (const auto& entry : list->entries) {
+        size_t comma = entry.value.find(',');
+        RequireResource(known, Trim(entry.value.substr(0, comma)), "need [" + entry.key + "]");
+        RequireResource(known, entry.key, "need [" + entry.key + "]");
+    }
+
+    fs::path media = GameRoot() / "media_soviet";
+    for (const auto& section : buildings.sections) if (Lower(section.name) != "buildings" &&
+        IsTrue(buildings.get(section.name, "enabled", "1"), true)) {
+        for (const auto& entry : section.entries) if (Lower(entry.key) == "line") {
+            auto words = Words(entry.value); if (words.size() < 2) continue;
+            std::string command = Lower(words[0]);
+            if (command == "$production" || command == "$consumption" || command == "$consumption_per_second")
+                RequireResource(known, words[1], "building [" + section.name + "]");
+            else if (command.rfind("$storage", 0) == 0 && words.size() >= 3 && !LooksNumeric(words.back()) &&
+                     Lower(words.back()).rfind("resource_transport_", 0) != 0)
+                RequireResource(known, words.back(), "building [" + section.name + "]");
+        }
+        std::string donor = buildings.get(section.name, "donor");
+        if (donor.empty()) g_validationErrors.push_back("building [" + section.name + "] has no donor");
+        else {
+            if (!fs::is_regular_file(media / "buildings_types" / fs::u8path(donor + ".ini")))
+                g_validationErrors.push_back("building [" + section.name + "] donor is missing buildings_types/" + donor + ".ini");
+            if (!fs::is_regular_file(media / "buildings" / fs::u8path(donor + ".nmf")))
+                g_validationErrors.push_back("building [" + section.name + "] donor is missing buildings/" + donor + ".nmf");
+            if (!fs::is_regular_file(media / "buildings" / fs::u8path(donor + ".mtl")))
+                g_validationErrors.push_back("building [" + section.name + "] donor is missing buildings/" + donor + ".mtl");
+        }
+    }
+    return g_validationErrors.empty();
 }
 
 static bool ApplyDomainPlans() {
@@ -597,6 +767,7 @@ static std::vector<WipMismatch> FindWipMismatches(
 static fs::path WorkshopWipRoot() {
     wchar_t exe[32768]{};
     DWORD count = GetModuleFileNameW((HMODULE)H->exeModule, exe, (DWORD)(sizeof(exe) / sizeof(exe[0])));
+    if (!H->exeModule) return g_base.parent_path() / "media_soviet" / "workshop_wip";
     if (!count || count >= sizeof(exe) / sizeof(exe[0])) return {};
     return fs::path(exe).parent_path() / "media_soviet" / "workshop_wip";
 }
@@ -659,10 +830,10 @@ struct EmbeddedPlugin {
     bool initialized;
 };
 static EmbeddedPlugin g_embedded[] = {
-    {"buildings", "buildings.dll", SmlBuildingsApiVersion, SmlBuildingsInit, nullptr, false},
+    {"resources", "resources.dll", SmlResourcesApiVersion, SmlResourcesInit, nullptr, false},
     {"deposits",  "deposits.dll",  SmlDepositsApiVersion,  SmlDepositsInit,  nullptr, false},
     {"needs",     "needs.dll",     SmlNeedsApiVersion,     SmlNeedsInit,     SmlNeedsStart, false},
-    {"resources", "resources.dll", SmlResourcesApiVersion, SmlResourcesInit, nullptr, false}
+    {"buildings", "buildings.dll", SmlBuildingsApiVersion, SmlBuildingsInit, nullptr, false}
 };
 
 static bool DisableExternalPlugins() {
@@ -702,6 +873,78 @@ static void InitEmbeddedPlugins() {
         H->log("sml       embedded %-12s %s initialized", component.key, info.version ? info.version : "?");
     }
 }
+
+static int PlannedCount(const char* domain, const char* settings, bool listDomain) {
+    Ini ini; if (!LoadPlannedDomain(domain, ini)) return -1;
+    return (int)ContentCount(ini, settings, listDomain);
+}
+
+static bool EmbeddedInitialized(const char* key) {
+    for (const auto& component : g_embedded)
+        if (strcmp(component.key, key) == 0) return component.initialized;
+    return false;
+}
+
+static bool ValidateEmbeddedRuntime() {
+    std::vector<std::string> errors;
+    int expectedResources = PlannedCount("resources", "resources", true);
+    int actualResources = SmlResourcesDeclaredCount();
+    if (expectedResources != actualResources)
+        errors.push_back("resources planned=" + std::to_string(expectedResources) +
+                         ", registered=" + std::to_string(actualResources));
+    if (expectedResources > 0 && !SmlResourcesHookReady())
+        errors.push_back("resources registration hook was not installed in mode 2");
+    if (expectedResources > 0 && !EmbeddedInitialized("resources"))
+        errors.push_back("resources component declined initialization");
+    Ini resources;
+    if (LoadPlannedDomain("resources", resources)) if (const Section* list = resources.find("list")) {
+        std::set<std::string> actual;
+        for (int i = 0; i < actualResources; ++i) {
+            const char* name = SmlResourcesDeclaredName(i); if (name) actual.insert(Lower(name));
+        }
+        for (const auto& entry : list->entries) if (!actual.count(Lower(entry.key)))
+            errors.push_back("resource was not registered: " + entry.key);
+    }
+
+    int expectedDeposits = PlannedCount("deposits", "deposits", false);
+    int actualDeposits = SmlDepositsDeclaredCount();
+    if (expectedDeposits != actualDeposits)
+        errors.push_back("deposits planned=" + std::to_string(expectedDeposits) +
+                         ", accepted=" + std::to_string(actualDeposits));
+    if (expectedDeposits > 0 && !SmlDepositsPatchReady())
+        errors.push_back("deposit type patch was not installed");
+    if (expectedDeposits > 0 && !SmlDepositsMapsReady())
+        errors.push_back("additional deposit map hooks were not installed");
+    if (expectedDeposits > 0 && !EmbeddedInitialized("deposits"))
+        errors.push_back("deposits component declined initialization");
+
+    int expectedNeeds = PlannedCount("needs", "needs", true);
+    int actualNeeds = SmlNeedsDeclaredCount();
+    if (expectedNeeds != actualNeeds)
+        errors.push_back("needs planned=" + std::to_string(expectedNeeds) +
+                         ", accepted=" + std::to_string(actualNeeds));
+    if (expectedNeeds > 0 && !EmbeddedInitialized("needs"))
+        errors.push_back("needs component declined initialization");
+
+    int expectedBuildings = PlannedCount("buildings", "buildings", false);
+    if (expectedBuildings != SmlBuildingsEnabledCount())
+        errors.push_back("buildings planned=" + std::to_string(expectedBuildings) +
+                         ", enabled=" + std::to_string(SmlBuildingsEnabledCount()));
+    if (SmlBuildingsIncompleteCount() > 0 || SmlBuildingsCompleteCount() != expectedBuildings)
+        errors.push_back("buildings complete=" + std::to_string(SmlBuildingsCompleteCount()) +
+                         ", incomplete=" + std::to_string(SmlBuildingsIncompleteCount()));
+    if (expectedBuildings > 0 && !EmbeddedInitialized("buildings"))
+        errors.push_back("buildings component declined initialization");
+
+    if (errors.empty()) {
+        H->log("sml       validation OK: resources=%d deposits=%d needs=%d buildings=%d",
+               actualResources, actualDeposits, actualNeeds, SmlBuildingsCompleteCount());
+        return true;
+    }
+    g_validationErrors = std::move(errors);
+    for (const auto& error : g_validationErrors) H->log("sml       FATAL %s", error.c_str());
+    return false;
+}
 static void LoadHooks() {
     if (!g_loadHooks) return; std::error_code ec;
     for (auto& m : g_mods) if (m.usable()) for (const auto& path : m.hooks) {
@@ -719,14 +962,14 @@ static void LoadHooks() {
 
 static const char* ModStateText(SmlModState state) {
     switch (state) {
-        case SML_MOD_ACTIVE: return "ativo";
-        case SML_MOD_ADDED: return "novo";
-        case SML_MOD_CONFLICT: return "conflito";
-        case SML_MOD_DISABLED: return "desativado";
-        case SML_MOD_INCOMPATIBLE: return "incompatível";
-        case SML_MOD_MISSING_DEPENDENCY: return "dependência ausente";
-        case SML_MOD_ERROR: return "erro";
-        default: return "desconhecido";
+        case SML_MOD_ACTIVE: return "active";
+        case SML_MOD_ADDED: return "added";
+        case SML_MOD_CONFLICT: return "conflict";
+        case SML_MOD_DISABLED: return "disabled";
+        case SML_MOD_INCOMPATIBLE: return "incompatible";
+        case SML_MOD_MISSING_DEPENDENCY: return "missing dependency";
+        case SML_MOD_ERROR: return "error";
+        default: return "unknown";
     }
 }
 
@@ -786,19 +1029,30 @@ static void ShowWipMismatchWarning(const std::vector<WipMismatch>& mismatches) {
                 MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST);
 }
 
+static void ShowValidationFailure(const std::vector<std::string>& errors, bool applied) {
+    std::ostringstream message;
+    message << "Soviet Mod Loader detected unsafe content and blocked game startup.\r\n\r\n";
+    for (const auto& error : errors) message << "- " << error << "\r\n";
+    message << "\r\nSee tesmioloader.log and fix the mod or installation before trying again.";
+    if (!applied) message << " No SML configuration was applied.";
+    std::wstring wide = Utf8Wide(message.str());
+    MessageBoxW(nullptr, wide.c_str(), L"Soviet Mod Loader - startup blocked",
+                MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST);
+}
+
 static bool ConfirmModsWithUser() {
     int usable = 0, warnings = 0;
     std::ostringstream details;
-    details << "MODS QUE SERÃO CARREGADOS\r\n";
+    details << "MODS TO BE LOADED\r\n";
     for (const auto& m : g_mods) if (m.usable()) {
         usable++;
         details << "• " << m.name << " " << m.version << "  [" << m.id << "]";
-        if (m.state == SML_MOD_CONFLICT) details << " — conflito";
+        if (m.state == SML_MOD_CONFLICT) details << " - conflict";
         details << "\r\n";
     }
     for (const auto& m : g_mods) if (!m.usable() || m.state == SML_MOD_CONFLICT) warnings++;
     if (warnings) {
-        details << "\r\nAVISOS\r\n";
+        details << "\r\nWARNINGS\r\n";
         for (const auto& m : g_mods) if (!m.usable() || m.state == SML_MOD_CONFLICT) {
             details << "• " << m.name << " [" << ModStateText(m.state) << "]";
             if (!m.detail.empty()) details << ": " << m.detail;
@@ -807,12 +1061,12 @@ static bool ConfirmModsWithUser() {
     }
 
     std::wstring title = L"Soviet Mod Loader";
-    std::wstring instruction = L"A configuração de mods foi alterada";
-    std::wstring content = L"O SML carregará " + std::to_wstring(usable) +
-                           (usable == 1 ? L" mod. Deseja iniciar o jogo?" : L" mods. Deseja iniciar o jogo?");
+    std::wstring instruction = L"The mod configuration has changed";
+    std::wstring content = L"SML will load " + std::to_wstring(usable) +
+                           (usable == 1 ? L" mod. Start the game?" : L" mods. Start the game?");
     std::wstring expanded = Utf8Wide(details.str());
-    std::wstring acceptText = L"Carregar mods e iniciar\nAplicar a configuração exibida e continuar.";
-    std::wstring declineText = L"Recusar e encerrar\nNão aplicar alterações e fechar o jogo.";
+    std::wstring acceptText = L"Load mods and start\nApply the displayed configuration and continue.";
+    std::wstring declineText = L"Decline and exit\nDo not apply changes; close the game.";
     TASKDIALOG_BUTTON buttons[] = {{1001, acceptText.c_str()}, {1002, declineText.c_str()}};
 
     HMODULE common = GetModuleHandleW(L"comctl32.dll"); bool owned = false;
@@ -825,15 +1079,15 @@ static bool ConfirmModsWithUser() {
         cfg.pszWindowTitle = title.c_str(); cfg.pszMainIcon = warnings ? TD_WARNING_ICON : TD_INFORMATION_ICON;
         cfg.pszMainInstruction = instruction.c_str(); cfg.pszContent = content.c_str();
         cfg.cButtons = (UINT)(sizeof(buttons) / sizeof(buttons[0])); cfg.pButtons = buttons; cfg.nDefaultButton = 1001;
-        cfg.pszExpandedInformation = expanded.c_str(); cfg.pszExpandedControlText = L"Mostrar detalhes";
-        cfg.pszCollapsedControlText = L"Ocultar detalhes";
+        cfg.pszExpandedInformation = expanded.c_str(); cfg.pszExpandedControlText = L"Show details";
+        cfg.pszCollapsedControlText = L"Hide details";
         int pressed = IDCANCEL; HRESULT hr = taskDialog(&cfg, &pressed, nullptr, nullptr);
         if (owned) FreeLibrary(common);
         if (SUCCEEDED(hr)) return pressed == 1001;
     } else if (owned) FreeLibrary(common);
 
     std::wstring fallback = instruction + L"\r\n\r\n" + content + L"\r\n\r\n" + expanded +
-                            L"\r\nSelecione Sim para carregar ou Não para encerrar.";
+                            L"\r\nSelect Yes to load mods or No to exit.";
     int answer = MessageBoxW(nullptr, fallback.c_str(), title.c_str(),
                              MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON1 | MB_SETFOREGROUND | MB_TOPMOST);
     return answer == IDYES;
@@ -864,9 +1118,16 @@ static const SmlApi kApi = {ApiCount, ApiGet, ApiGeneration};
 extern "C" __declspec(dllexport) unsigned TsmPluginApiVersion(void) { return TSM_API_VERSION; }
 
 extern "C" __declspec(dllexport) int TsmPluginInit(const TsmHost* host, TsmPluginInfo* info) {
-    H = host; info->name = "Soviet Mod Loader"; info->version = "0.4.1"; g_base = fs::u8path(host->baseDir); g_vfsRoot = ResolveVfsRoot(g_base);
-    std::string vfsText = PathUtf8(g_vfsRoot); SmlDepositsSetVfsRoot(vfsText.c_str());
-    const char* ini = "plugins\\000_soviet_mod_loader.ini"; char value[1024]{};
+    H = host; info->name = "Soviet Mod Loader"; info->version = "0.5.2"; g_base = fs::u8path(host->baseDir);
+    g_applicationReady = false; g_pendingConfirmationIndex.clear();
+    g_vfsRoot = host->structSize >= offsetof(TsmHost, vfsRoot) + sizeof(host->vfsRoot) && host->vfsRoot
+              ? fs::u8path(host->vfsRoot) : ResolveVfsRoot(g_base);
+    const char* ini = "plugins\\soviet_mod_loader.ini";
+    std::error_code configEc;
+    if (!fs::is_regular_file(g_base / "plugins" / "soviet_mod_loader.ini", configEc) &&
+        fs::is_regular_file(g_base / "plugins" / "000_soviet_mod_loader.ini", configEc))
+        ini = "plugins\\000_soviet_mod_loader.ini";
+    char value[1024]{};
     if (!H->configInt(ini, "loader", "enabled", 1)) return 1;
     int appId = H->configInt(ini, "loader", "steam_app_id", 784150);
     H->configString(ini, "loader", "workshop_root", value, sizeof(value), "auto"); std::string rootSetting = value;
@@ -888,6 +1149,13 @@ extern "C" __declspec(dllexport) int TsmPluginInit(const TsmHost* host, TsmPlugi
         g_domainPlans.clear();
         PlanDomain("resources"); PlanDomain("deposits"); PlanDomain("needs"); PlanDomain("buildings");
         PlanAssets();
+
+        if (!ValidatePlannedContent()) {
+            for (const auto& error : g_validationErrors) H->log("sml       FATAL %s", error.c_str());
+            ShowValidationFailure(g_validationErrors, false);
+            ExitProcess(ERROR_INVALID_DATA);
+            return 1;
+        }
 
         fs::path wipRoot = WorkshopWipRoot();
         std::vector<WipMismatch> wipMismatches = FindWipMismatches(wipRoot, ExpectedWipBuildings());
@@ -918,11 +1186,24 @@ extern "C" __declspec(dllexport) int TsmPluginInit(const TsmHost* host, TsmPlugi
         applied = ApplyDomainPlans() && applied;
         applied = SaveCatalog() && applied;
         applied = ApplyAssetPlan() && applied;
-        InitEmbeddedPlugins(); LoadHooks(); applied = SaveModIndex() && applied;
+        InitEmbeddedPlugins();
+#ifdef SML_TESTING
+        bool runtimeValid = true;
+#else
+        bool runtimeValid = ValidateEmbeddedRuntime();
+#endif
+        if (runtimeValid) LoadHooks();
+        applied = runtimeValid && SaveModIndex() && applied;
         if (applied) {
-            if (!SaveConfirmationIndex(confirmationIndex)) H->log("sml       failed to persist confirmation.index");
+            g_pendingConfirmationIndex = confirmationIndex;
+            g_applicationReady = true;
         } else {
             H->log("sml       application incomplete; confirmation will be requested again");
+        }
+        if (!runtimeValid) {
+            ShowValidationFailure(g_validationErrors, true);
+            ExitProcess(ERROR_INVALID_DATA);
+            return 1;
         }
         if (g_externalAlreadyLoaded) H->log("sml       restart required once; external plugin keys are now disabled");
     } catch (const std::exception& e) { H->log("sml       soft failure: %s", e.what()); return 1; }
@@ -935,6 +1216,20 @@ extern "C" __declspec(dllexport) int TsmPluginStart(void) {
         int rc = CallChildStart(component.start);
         if (rc) H->log("sml       embedded %s Start returned %d", component.key, rc);
     }
+    if (PlannedCount("needs", "needs", true) > 0 && !SmlNeedsHooksReady()) {
+        g_validationErrors = {"required needs hooks were not installed"};
+        H->log("sml       FATAL %s", g_validationErrors[0].c_str());
+        ShowValidationFailure(g_validationErrors, true);
+        ExitProcess(ERROR_INVALID_DATA);
+        return 1;
+    }
     for (auto& child : g_children) if (child.start) { int rc = CallChildStart(child.start); if (rc) H->log("sml       hook %s Start returned %d", child.name.c_str(), rc); }
+    if (g_applicationReady && !g_pendingConfirmationIndex.empty()) {
+        if (!SaveConfirmationIndex(g_pendingConfirmationIndex))
+            H->log("sml       failed to persist confirmation.index after runtime validation");
+        else
+            H->log("sml       confirmation.index persisted after all component validations");
+        g_pendingConfirmationIndex.clear();
+    }
     return 0;
 }
