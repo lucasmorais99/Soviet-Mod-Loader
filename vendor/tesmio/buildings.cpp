@@ -120,6 +120,13 @@ struct Decl
 
 static Decl g_decl[MAX_BUILDINGS];
 static int  g_declCount;
+static int  g_smlBuildingsEnabled;
+static int  g_smlBuildingsComplete;
+static int  g_smlBuildingsIncomplete;
+
+extern "C" int SmlBuildingsEnabledCount(void) { return g_smlBuildingsEnabled; }
+extern "C" int SmlBuildingsCompleteCount(void) { return g_smlBuildingsComplete; }
+extern "C" int SmlBuildingsIncompleteCount(void) { return g_smlBuildingsIncomplete; }
 
 static int  g_enabled    = 1;
 static int  g_always     = 0;          // regenerate even when the stamp matches
@@ -545,7 +552,7 @@ static bool StampMatches(const char* item, unsigned long long want)
     return have == want;
 }
 
-static void Generate(Decl* d)
+static bool Generate(Decl* d)
 {
     char donorIni[MAX_PATH], item[MAX_PATH], obj[MAX_PATH], src[MAX_PATH], dst[MAX_PATH];
 
@@ -555,7 +562,7 @@ static void Generate(Decl* d)
     {
         Logf("building \"%s\": donor \"%s\" has no %s - nothing generated",
              d->section, d->donor, donorIni);
-        return;
+        return false;
     }
 
     char outRoot[MAX_PATH];
@@ -576,12 +583,12 @@ static void Generate(Decl* d)
             Logf("building \"%s\": %s exists and was not written by this plugin "
                  "(no " STAMP_NAME ") - refusing to touch it. Give the section another id",
                  d->section, item);
-            return;
+            return false;
         }
         if (!g_always && StampMatches(item, want))
         {
             Logf("building \"%s\" -> %s  up to date", d->section, d->id);
-            return;
+            return true;
         }
     }
 
@@ -590,12 +597,12 @@ static void Generate(Decl* d)
     if (!CreateDirectoryA(item, NULL) && GetLastError() != ERROR_ALREADY_EXISTS)
     {
         Logf("building ERROR could not create %s (%lu)", item, GetLastError());
-        return;
+        return false;
     }
     if (!CreateDirectoryA(obj, NULL) && GetLastError() != ERROR_ALREADY_EXISTS)
     {
         Logf("building ERROR could not create %s (%lu)", obj, GetLastError());
-        return;
+        return false;
     }
 
     bool ok = true;
@@ -647,7 +654,7 @@ static void Generate(Decl* d)
     {
         Logf("building \"%s\" -> %s  INCOMPLETE - the game may refuse it or crash on it",
              d->section, d->id);
-        return;
+        return false;
     }
 
     char stampText[512];
@@ -666,6 +673,7 @@ static void Generate(Decl* d)
          d->section, d->id, d->object, d->donor,
          d->lines + (d->name[0] ? 1 : 0), dropped, rewrote + rewroteE,
          emissive ? ", emissive material" : "");
+    return true;
 }
 
 // ---------------------------------------------------------------- the config
@@ -831,18 +839,24 @@ extern "C" int TsmPluginInit(const TsmHost* host, TsmPluginInfo* info)
     Logf("building generating into %s", outRoot);
 
     int made = 0;
+    g_smlBuildingsEnabled = g_smlBuildingsComplete = g_smlBuildingsIncomplete = 0;
     for (int i = 0; i < g_declCount; i++)
     {
         Decl* d = &g_decl[i];
 
         if (!d->enabled) { Logf("building \"%s\" enabled = 0 - skipped", d->section); continue; }
-        if (!d->id[0])   { Logf("building \"%s\" has no id - skipped", d->section);   continue; }
-        if (!d->donor[0]){ Logf("building \"%s\" has no donor - skipped", d->section); continue; }
+        g_smlBuildingsEnabled++;
+        if (!d->id[0])   { Logf("building \"%s\" has no id - skipped", d->section); g_smlBuildingsIncomplete++; continue; }
+        if (!d->donor[0]){ Logf("building \"%s\" has no donor - skipped", d->section); g_smlBuildingsIncomplete++; continue; }
 
-        __try { Generate(d); made++; }
+        __try {
+            if (Generate(d)) { made++; g_smlBuildingsComplete++; }
+            else g_smlBuildingsIncomplete++;
+        }
         __except (FaultFilter("buildings generate", GetExceptionInformation()))
         {
             Logf("building \"%s\" faulted while generating - skipped", d->section);
+            g_smlBuildingsIncomplete++;
         }
     }
 
@@ -851,4 +865,3 @@ extern "C" int TsmPluginInit(const TsmHost* host, TsmPluginInfo* info)
 }
 
 BOOL APIENTRY DllMain(HMODULE, DWORD, LPVOID) { return TRUE; }
-

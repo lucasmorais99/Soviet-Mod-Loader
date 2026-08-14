@@ -2,15 +2,15 @@
 
 ## Upstream contract
 
-The implementation targets TesmioLoader API v3. A normal Tesmio plugin exports
+The implementation targets TesmioLoader API v4. A normal Tesmio plugin exports
 `TsmPluginApiVersion`, `TsmPluginInit`, and optionally `TsmPluginStart`. `Init`
 publishes services and reads configuration; `Start` consumes services and
 installs dependent hooks. Data crossing the DLL boundary remains POD/C strings.
 
-TesmioLoader discovers ordinary DLLs under `tesmioloader/plugins`, but its
+TesmioLoader discovers ordinary DLLs under `tesmioloader/build/plugins`, but its
 enumeration order is not used as a correctness mechanism. The upstream
 `buildings`, `deposits`, `needs`, and `resources` sources are built as separate
-translation units and linked into `000_soviet_mod_loader.dll`. Their exports
+translation units and linked into `soviet_mod_loader.dll`. Their exports
 are renamed internally so the manager controls when each `Init` and `Start`
 runs while preserving independent file-scope state.
 
@@ -40,14 +40,16 @@ flowchart LR
     A[Steam libraries] --> B[Workshop item scan]
     B --> C[Manifest and API validation]
     C --> D[Dependency ordering]
-    D --> P[Plan merges/assets and detect conflicts]
+    D --> P[Plan merges/assets, enforce invariants, validate references]
     P --> Q{Changed set accepted?}
     Q -->|No| X[Exit before application]
     Q -->|Yes| E[Apply four INI merges]
     Q -->|Yes| F[Incremental VFS asset sync]
-    E --> G[Embedded buildings/deposits/needs/resources Init]
+    E --> G[Embedded resources/deposits/needs/buildings Init]
     F --> G
-    G --> H[Workshop child DLL Init]
+    G --> V{Runtime catalogs and hooks valid?}
+    V -->|No| X
+    V -->|Yes| H[Workshop child DLL Init]
     H --> I[Embedded and child Start phases]
 ```
 
@@ -77,6 +79,19 @@ For `resources` and `needs`, conflicts are resolved per section/key. For
 `deposits` and `buildings`, a named content section is atomic so repeated keys
 such as `line` stay intact. Core settings sections are protected unless a mod
 explicitly sets `allow_settings = 1`.
+
+Content-required settings are stronger than both the baseline and
+`allow_settings`: a non-empty resource list forces `hook=2`; deposits force
+`code_patch=1`; needs force `enabled`, `demand`, and `storage`; buildings force
+`enabled` and the reserved `media_soviet\\workshop_wip` output. Static
+validation resolves building production/consumption/storage, deposit icons,
+needs, resource clones, and building donor assets before confirmation.
+
+After application, the manager validates private component status interfaces:
+resource names/count, deposit count plus type/map hooks, need count, and
+building enabled/complete/incomplete counts. These are internal link-time
+contracts and do not change the public `SmlApi`. The confirmation signature is
+persisted only after this runtime validation passes.
 
 States are `active`, `added`, `conflict`, `disabled`, `incompatible`,
 `missing dependency`, and `error`. A conflict is non-fatal: the loser stays
@@ -115,8 +130,9 @@ loader VFS by relative path. In a source layout where the DLL base is
 `tesmioloader/build/vfs`. A distributed layout with the DLL directly inside
 `tesmioloader` continues to use `tesmioloader/vfs`. Only changed bytes are copied. Removed assets are
 deleted only when the staged file still matches the hash last written by this
-loader, preserving a locally edited file. This staging is necessary because
-TesmioLoader v3 does not publish a VFS mount API.
+loader, preserving a locally edited file. TesmioLoader API v4 publishes the
+resolved root as `TsmHost::vfsRoot`; it does not publish a direct VFS mount API,
+so staging remains necessary.
 
 The incorporated deposits component receives this resolved VFS root directly.
 Its blank `resourcemapN` fallback is therefore created under the same VFS the
@@ -134,6 +150,12 @@ the cataloged type and section name derive an independent seed for each
 deposit. Up to 32 cataloged deposits occupy the 32 channels in
 `resourcemap3..resourcemap10`.
 
+An optional per-deposit `richness_offset` in `[-0.25,+0.25]` is added to the
+normalized fractal field before the fixed `0.61` threshold. Positive values
+increase both coverage and intensity; negative values reduce both. Zero is the
+compatibility default. The setting is consulted only while filling an
+uninitialized channel, so changing it never rewrites a persisted DDS.
+
 `soviet_mod_loader_deposits.ini`, saved beside the world, records format, seed,
 and the map/component owned by every initialized catalog type. When a mod is
 installed later, its absent entry causes only its channel to be generated; all
@@ -145,8 +167,12 @@ data over retroactive generation.
 Generated load sources live only in
 `tesmioloader/vfs/media_soviet/tesmio/procedural/<game-hash>`; source DDS files
 are never edited during loading. The existing save hook persists eligible
-textures and atomically writes the manifest. Invalid existing DDS files are
-left untouched and not saved again. A failed new generation uses an unsaved
+textures. The manifest path is resolved physically against the game directory's
+`media_soviet`: relative forms such as `saved_last`, `campaign1`,
+`save/<world>`, and an optional `media_soviet` prefix are accepted. Absolute
+paths are accepted only below that same root; parent traversal is rejected. The
+directory is created when needed and the manifest is atomically replaced.
+Invalid existing DDS files are left untouched and not saved again. A failed new generation uses an unsaved
 blank at runtime, while a missing live texture samples as zero richness.
 
 Native DLLs listed under `[hooks]` are loaded from their Workshop folder. Their
@@ -166,13 +192,17 @@ again after the merge on that first launch. This fixes the original stale
 
 ## Compatibility boundary
 
-The project mirrors the current upstream `TsmHost` v3 layout and reports API 3.
-It does not append fields to that ABI. Mods declare a supported host range and
-fail softly outside it. Existing Tesmio plugins remain unmodified and retain
-their own verified hook/prologue protections against game updates.
+The project mirrors the current upstream `TsmHost` v4 layout and reports API 4.
+It checks `structSize` before reading the appended `vfsRoot` field. Workshop
+hooks may declare a supported host range including API 3 or 4 and fail softly
+outside it. Existing Tesmio plugins retain their own verified hook/prologue
+protections against game updates.
 
-The vendored component sources match TesmioLoader commit
-`07f6b3e47411e04cf05429ac08e07819f94549c1`; only the include path, internal
-entry-point names, and removal of `dllexport` from those internal entry points
-differ. The resulting DLL exposes only the Soviet Mod Loader's three Tesmio
-exports.
+The synchronization baseline is TesmioLoader commit
+`3baa141f9f08921aea9c95f0a400289cabd9960a` (b0.3.6). `resources` and `needs`
+match their active upstream sources except for the local include and internal,
+non-exported entry points. `deposits` carries those changes plus the SML's
+universal generation and persistence layer. `buildings`, parked by the upstream
+b0.3.6 build, remains incorporated because it is address-independent and part
+of the SML content contract. The resulting DLL exposes only the Soviet Mod
+Loader's three Tesmio exports.

@@ -23,7 +23,7 @@
 // deposits.ini declared - and carry its own per-deposit keys in the same file.
 // `depletion` does both.
 //
-// Everything here is addresses for SOVIET64.exe v1.1.1.7. See
+// Everything here is addresses for SOVIET64.exe v1.1.1.9. See
 // docs/05-deposits.md.
 
 #include "tesmio_plugin.h"
@@ -41,7 +41,9 @@
 // name resolve without either plugin knowing about the other - if `resources`
 // is installed its hook is on that address, and if it is not, the base game's
 // own lookup answers and a mod icon simply has no record.
-#define P_RESOURCEGET   0x2AA7C0
+#define P_RESOURCEGET   0x2AA830   // v1.1.1.9; was 0x2AA7C0. Independent of
+                                   // plugins/resources' own copy of this same
+                                   // address - see docs/02-findings.md
 typedef unsigned __int64 (*t_ResourceGet)(void*, void*, void*, void*);
 
 // ---------------------------------------------------------------- deposit registry
@@ -111,6 +113,7 @@ struct DepositDef
     char  icon[64];        // resource whose record supplies the minimap icon
     int   wantMinimap;
     char  editor[32];      // "copper" -> paint_copper / erase_copper; empty = no brush
+    float richnessOffset;  // added to procedural noise before the fixed threshold
 
     // Anything in the section the loader itself has no use for, kept verbatim
     // so a plugin can carry its own per-deposit settings in the same file. The
@@ -239,6 +242,18 @@ static void LoadDepositRegistry()
         else if (KeyIs(line, "building_type")) d->buildingType = (int)strtol(val, NULL, 0);
         else if (KeyIs(line, "component"))     d->component    = (int)strtol(val, NULL, 0);
         else if (KeyIs(line, "minimap"))       d->wantMinimap  = (int)strtol(val, NULL, 0);
+        else if (KeyIs(line, "richness_offset"))
+        {
+            char* end = NULL;
+            double parsed = strtod(val, &end);
+            if (!end || *end || !isfinite(parsed) || parsed < -0.25 || parsed > 0.25)
+            {
+                d->richnessOffset = 0.0f;
+                Logf("deposits  \"%s\": invalid richness_offset \"%s\"; using 0.00",
+                     d->name, val);
+            }
+            else d->richnessOffset = (float)parsed;
+        }
         else if (KeyIs(line, "map"))
         {
             // "resourcemap", "resourcemap2", ... "resourcemapN", the bare
@@ -494,19 +509,24 @@ static void ValidateDeposits()
 // runtime base, so only the rvas are hard-coded - and those are verified byte
 // for byte before a single byte is written.
 
-#define P_PARSER_SITE      0x10EAC8   // LEA RDX,[$TYPE_MINE_BAUXITE]
-#define P_PARSER_NEXT      0x10EAF8   // next token check
-#define P_PARSER_DONE      0x118815   // shared exit
-#define P_STRCMP           0x84F340
-#define P_STR_BAUXITE      0x8895C0
+// v1.1.1.9 rvas throughout this file; old values noted per line, derivation in
+// docs/02-findings.md. The parser site's own bytes include a rip-relative
+// displacement to $TYPE_MINE_BAUXITE, which is why kParserOrig below is not
+// simply the old bytes: the string did not move, so the displacement had to
+// change when the site did.
+#define P_PARSER_SITE      0x10EAB8   // was 0x10EAC8. LEA RDX,[$TYPE_MINE_BAUXITE]
+#define P_PARSER_NEXT      0x10EAE8   // was 0x10EAF8. next token check
+#define P_PARSER_DONE      0x118805   // was 0x118815. shared exit
+#define P_STRCMP           0x84F520   // was 0x84F340
+#define P_STR_BAUXITE      0x8895C0   // unchanged - .rdata string, not in the float pool
 #define P_PARSER_TOKEN     0x49A0     // [rbp+..] the token just read
 #define P_PARSER_BTYPE     0x1E10     // [rbp+..] building type
 #define P_PARSER_DTYPE     0x1E18     // [rbp+..] deposit type
 
-#define P_DISPATCH_SITE    0x1DD773   // CMP [RSI+0x368],6
-#define P_DISPATCH_BODY6   0x1DD77C   // body of the type 6 case
-#define P_DISPATCH_TAIL    0x1DD7B6   // CMP [RSI+0x368],7
-#define P_GAMEOBJ          0x9941F0
+#define P_DISPATCH_SITE    0x1DD7E3   // was 0x1DD773. CMP [RSI+0x368],6
+#define P_DISPATCH_BODY6   0x1DD7EC   // was 0x1DD77C. body of the type 6 case
+#define P_DISPATCH_TAIL    0x1DD826   // was 0x1DD7B6. CMP [RSI+0x368],7
+#define P_GAMEOBJ          0x9941F0   // unchanged - .data does not move in this build
 #define P_SAMPLER          0x8360
 #define P_DEP_TYPE_FIELD   0x368      // building object, the deposit type
 #define P_MAP1_OFF         0xF00      // gameobj -> resourcemap
@@ -523,8 +543,8 @@ static void ValidateDeposits()
 //   1DCADA  C3                    RET
 //   1DCADB  0F 57 C0              XORPS XMM0,XMM0
 //   1DCADE  C3                    RET
-#define P_RADIUS_SITE      0x1DCACD
-#define P_RADIUS_WATERSURF 0x90AC38   // the constant the type 9 branch returns
+#define P_RADIUS_SITE      0x1DCB3D   // was 0x1DCACD
+#define P_RADIUS_WATERSURF 0x90AC20   // was 0x90AC38 - the constant the type 9 branch returns
 
 // The terrain's own material mask, and the two sites that bracket it.
 //
@@ -544,10 +564,10 @@ static void ValidateDeposits()
 // and 1DDE08 is the same five instructions with MaskTextureClose. Opening it
 // per sample point instead would be a GPU Map/Unmap per point - the mistake
 // docs/07-pitfalls.md already records - so both are patched, or neither.
-#define P_MASK_OPEN_SITE   0x1DD499
-#define P_MASK_OPEN_NEXT   0x1DD4B6   // where its JNZ lands
-#define P_MASK_CLOSE_SITE  0x1DDE08
-#define P_MASK_CLOSE_NEXT  0x1DDE25
+#define P_MASK_OPEN_SITE   0x1DD509   // was 0x1DD499
+#define P_MASK_OPEN_NEXT   0x1DD526   // was 0x1DD4B6 - where its JNZ lands
+#define P_MASK_CLOSE_SITE  0x1DDE78   // was 0x1DDE08
+#define P_MASK_CLOSE_NEXT  0x1DDE95   // was 0x1DDE25
 #define P_MASK_OPEN_IAT    0x86CF38   // C3D_TERRAIN::MaskTextureOpen
 #define P_MASK_CLOSE_IAT   0x86CF30   // C3D_TERRAIN::MaskTextureClose
 #define P_TERRAIN_OFF      0xED8      // gameobj -> C3D_TERRAIN
@@ -579,24 +599,29 @@ static void ValidateDeposits()
 // Both sites are heads of their block and reached by fall-through only. The
 // cave puts our types in front of the displaced check, exactly as the mask
 // bracket does; the rejoin re-reads the type, so a clobbered EAX costs nothing.
-#define P_MAP_OPEN_SITE    0x1DD458
-#define P_MAP_OPEN_NEXT    0x1DD474   // the types 6-7 check, which re-reads EAX
-#define P_MAP_CLOSE_SITE   0x1DDE25
-#define P_MAP_CLOSE_NEXT   0x1DDE45   // the types 6-7 close check
+#define P_MAP_OPEN_SITE    0x1DD4C8   // was 0x1DD458
+#define P_MAP_OPEN_NEXT    0x1DD4E4   // was 0x1DD474 - the types 6-7 check, which re-reads EAX
+#define P_MAP_CLOSE_SITE   0x1DDE95   // was 0x1DDE25
+#define P_MAP_CLOSE_NEXT   0x1DDEB5   // was 0x1DDE45 - the types 6-7 close check
 #define P_TEX_OPEN         0x80       // TextureAccessOpen,  vtable slot 16
 #define P_TEX_CLOSE        0x90       // TextureAccessClose, vtable slot 18
 
-static const BYTE kParserOrig[]   = { 0x48, 0x8D, 0x15, 0xF1, 0xAA, 0x77, 0x00 };
+// v1.1.1.9. The displacement changed even though $TYPE_MINE_BAUXITE did not
+// move: the site did, so the compiler's own distance to the string changed
+// with it. Re-read directly off the new site rather than recomputed by hand.
+static const BYTE kParserOrig[]   = { 0x48, 0x8D, 0x15, 0x01, 0xAB, 0x77, 0x00 };
 static const BYTE kDispatchOrig[] = { 0x83, 0xBE, 0x68, 0x03, 0x00, 0x00, 0x06 };
 static const BYTE kRadiusOrig[]   = { 0x83, 0xF9, 0x09, 0x75, 0x09 };
 static const BYTE kMaskOrig[]     = { 0x83, 0xBE, 0x68, 0x03, 0x00, 0x00, 0x03 };  // both bracket sites
 // Verified past the bytes the jump replaces, so the check pins the site, not
 // just five common encodings: the MOV that follows carries the build's own
 // rip-relative displacement to the game object.
+// v1.1.1.9. Same reasoning as kParserOrig: the gameobj displacement is
+// recomputed from the new site even though P_GAMEOBJ (0x9941F0) is unchanged.
 static const BYTE kMapOpenOrig[]  = { 0x83, 0xF8, 0x02, 0x77, 0x17,
-                                      0x48, 0x8B, 0x05, 0x8C, 0x6D, 0x7B, 0x00 };
+                                      0x48, 0x8B, 0x05, 0x1C, 0x6D, 0x7B, 0x00 };
 static const BYTE kMapCloseOrig[] = { 0x83, 0xBE, 0x68, 0x03, 0x00, 0x00, 0x02, 0x77, 0x17,
-                                      0x48, 0x8B, 0x05, 0xBB, 0x63, 0x7B, 0x00 };
+                                      0x48, 0x8B, 0x05, 0x4B, 0x63, 0x7B, 0x00 };
 
 // ---------------------------------------------------------------- maps past the engine's two
 //
@@ -653,8 +678,12 @@ static const BYTE kMapCloseOrig[] = { 0x83, 0xBE, 0x68, 0x03, 0x00, 0x00, 0x02, 
 // bauxite layout, measured, and only its alpha is clear - and CreateManagedTexture
 // caches by path, so two extra maps loading one file would be one texture.
 
+// v1.1.1.9. P_WORLD_SAVE_RVA is unchanged - it sits early enough in .text that
+// nothing this update added lands before it, same as P_ED_TERRAIN_RVA below.
+// The call site moved with everything around it; found again by its
+// address-independent `mov rdx,r15` immediately before the call.
 #define P_WORLD_SAVE_RVA   0x7C20     // FUN_140007c20(self, folder) - SaveToDDS x4
-#define P_WORLD_SAVE_CALL  0x42CD0E   // the only `call 0x7C20` in the executable
+#define P_WORLD_SAVE_CALL  0x42CDAE   // was 0x42CD0E - the only `call 0x7C20` in the executable
 
 #define TEX_LOAD2D         2          // vtbl+0x10   Load2DFromFile(path,0,0,0,0)
 #define TEX_INIT_TEMP      19         // vtbl+0x98   TextureAccessInitTempResource
@@ -687,12 +716,6 @@ static ExtraMap g_extra[MAX_EXTRA_MAPS];
 
 static char g_extraFolder[MAX_PATH];   // the world folder the maps were loaded from
 static bool g_inExtraLoad;             // guards the CreateManagedTexture re-entry
-static char g_smlVfsRoot[MAX_PATH];    // resolved by the Soviet Mod Loader host
-
-extern "C" void SmlDepositsSetVfsRoot(const char* root)
-{
-    strncpy_s(g_smlVfsRoot, sizeof(g_smlVfsRoot), root ? root : "", _TRUNCATE);
-}
 
 typedef void* (__fastcall* t_CreateManagedTexture)(void*, const char*);
 typedef bool  (__cdecl*    t_FileExists)(const char*, bool, bool);
@@ -800,13 +823,27 @@ static const char* BlankMapPath()
 
     strncpy_s(rel, sizeof(rel), MAP_BLANK_REL, _TRUNCATE);
 
-    char fallbackVfs[MAX_PATH];
-    _snprintf_s(fallbackVfs, sizeof(fallbackVfs), _TRUNCATE, "%s\\vfs", g_baseDir);
-    const char* vfs = g_smlVfsRoot[0] ? g_smlVfsRoot : fallbackVfs;
+    // The actual VFS root, not baseDir\vfs: ResolveVfsRoot in tesmioloader.cpp
+    // prefers a `vfs` folder one level up from baseDir (the source tree's
+    // tesmioloader\vfs, true of every normal checkout) and only falls back to
+    // baseDir\vfs when no such sibling exists. Writing to the wrong guess
+    // failed outright - CreateDirectoryA is not recursive, so when baseDir\vfs
+    // itself does not exist yet, nothing downstream of it can be created
+    // either. g_vfsRoot is null only against a pre-v4 host; baseDir\vfs is the
+    // best that host can still be told, and was this function's whole guess
+    // before v4 existed.
+    const char* root = g_vfsRoot ? g_vfsRoot : NULL;
+    char rootBuf[MAX_PATH];
+    if (!root)
+    {
+        _snprintf_s(rootBuf, sizeof(rootBuf), _TRUNCATE, "%s\\vfs", g_baseDir);
+        root = rootBuf;
+    }
+
     char dir[MAX_PATH], file[MAX_PATH];
-    _snprintf_s(dir,  sizeof(dir),  _TRUNCATE, "%s\\media_soviet", vfs);
+    _snprintf_s(dir,  sizeof(dir),  _TRUNCATE, "%s\\media_soviet", root);
     CreateDirectoryA(dir, NULL);
-    _snprintf_s(dir,  sizeof(dir),  _TRUNCATE, "%s\\media_soviet\\tesmio", vfs);
+    _snprintf_s(dir,  sizeof(dir),  _TRUNCATE, "%s\\media_soviet\\tesmio", root);
     CreateDirectoryA(dir, NULL);
     _snprintf_s(file, sizeof(file), _TRUNCATE, "%s\\resourcemap_blank.dds", dir);
 
@@ -870,6 +907,8 @@ struct WorldDepositState
 };
 
 static WorldDepositState g_worldState;
+static bool g_smlPatchReady;
+static bool g_smlMapsReady;
 
 static unsigned __int64 SmlHashBytes(unsigned __int64 h, const void* data, size_t n)
 {
@@ -885,16 +924,119 @@ static unsigned __int64 SmlMix64(unsigned __int64 x)
     return x ^ (x >> 31);
 }
 
+static bool HasParentSegment(const char* path)
+{
+    const char* p = path;
+    while (p && *p)
+    {
+        while (*p == '/' || *p == '\\') p++;
+        const char* begin = p;
+        while (*p && *p != '/' && *p != '\\') p++;
+        if (p - begin == 2 && begin[0] == '.' && begin[1] == '.') return true;
+    }
+    return false;
+}
+
+static bool PathInside(const char* root, const char* candidate)
+{
+    size_t len = strlen(root);
+    return _strnicmp(root, candidate, len) == 0 &&
+           (candidate[len] == 0 || candidate[len] == '\\' || candidate[len] == '/');
+}
+
+static bool EnsureDirectoryTree(const char* path)
+{
+    char work[MAX_PATH];
+    strncpy_s(work, sizeof(work), path, _TRUNCATE);
+    for (char* p = work + 3; *p; p++)
+    {
+        if (*p != '\\' && *p != '/') continue;
+        char saved = *p; *p = 0;
+        if (!CreateDirectoryA(work, NULL) && GetLastError() != ERROR_ALREADY_EXISTS)
+            { *p = saved; return false; }
+        *p = saved;
+    }
+    return CreateDirectoryA(work, NULL) || GetLastError() == ERROR_ALREADY_EXISTS;
+}
+
+static bool ResolveUnderMediaRoot(const char* mediaRootInput, const char* folder,
+                                  char* out, size_t n, bool create)
+{
+    if (!folder || !*folder || HasParentSegment(folder))
+    {
+        SetLastError(ERROR_INVALID_NAME);
+        return false;
+    }
+
+    char mediaRoot[MAX_PATH];
+    if (!GetFullPathNameA(mediaRootInput, sizeof(mediaRoot), mediaRoot, NULL)) return false;
+
+    char raw[MAX_PATH];
+    bool absolute = (isalpha((unsigned char)folder[0]) && folder[1] == ':') ||
+                    (folder[0] == '\\' && folder[1] == '\\');
+    if (absolute)
+        strncpy_s(raw, sizeof(raw), folder, _TRUNCATE);
+    else
+    {
+        const char* rel = folder;
+        if (_strnicmp(rel, "media_soviet/", 13) == 0 ||
+            _strnicmp(rel, "media_soviet\\", 13) == 0) rel += 13;
+        if (!*rel || strchr(rel, ':')) { SetLastError(ERROR_INVALID_NAME); return false; }
+        _snprintf_s(raw, sizeof(raw), _TRUNCATE, "%s\\%s", mediaRoot, rel);
+    }
+
+    char full[MAX_PATH];
+    if (!GetFullPathNameA(raw, sizeof(full), full, NULL) || !PathInside(mediaRoot, full))
+    {
+        SetLastError(ERROR_ACCESS_DENIED);
+        return false;
+    }
+    for (char* p = full; *p; p++) if (*p == '/') *p = '\\';
+    if (create && !EnsureDirectoryTree(full)) return false;
+    strncpy_s(out, n, full, _TRUNCATE);
+    return true;
+}
+
+extern "C" int SmlDepositsResolveWorldPathForTest(const char* mediaRoot, const char* folder,
+                                                    char* out, size_t n)
+{
+    return ResolveUnderMediaRoot(mediaRoot, folder, out, n, false) ? 1 : 0;
+}
+
+static bool ResolveWorldDirectory(const char* folder, char* out, size_t n, bool create)
+{
+    char exePath[MAX_PATH], gameRoot[MAX_PATH], mediaRootRaw[MAX_PATH];
+    if (H && !H->exeModule && H->baseDir)
+    {
+        strncpy_s(gameRoot, sizeof(gameRoot), H->baseDir, _TRUNCATE);
+        char* slash = strrchr(gameRoot, '\\');
+        char* alt = strrchr(gameRoot, '/');
+        if (!slash || (alt && alt > slash)) slash = alt;
+        if (!slash) { SetLastError(ERROR_INVALID_NAME); return false; }
+        *slash = 0;
+    }
+    else
+    {
+        HMODULE module = H && H->exeModule ? (HMODULE)H->exeModule : GetModuleHandleA(NULL);
+        DWORD got = GetModuleFileNameA(module, exePath, sizeof(exePath));
+        if (!got || got >= sizeof(exePath)) return false;
+        strncpy_s(gameRoot, sizeof(gameRoot), exePath, _TRUNCATE);
+        char* slash = strrchr(gameRoot, '\\');
+        char* alt = strrchr(gameRoot, '/');
+        if (!slash || (alt && alt > slash)) slash = alt;
+        if (!slash) { SetLastError(ERROR_INVALID_NAME); return false; }
+        *slash = 0;
+    }
+    _snprintf_s(mediaRootRaw, sizeof(mediaRootRaw), _TRUNCATE, "%s\\media_soviet", gameRoot);
+    return ResolveUnderMediaRoot(mediaRootRaw, folder, out, n, create);
+}
+
 static bool ResolveWorldFile(const char* folder, const char* name, char* out, size_t n)
 {
-    _snprintf_s(out, n, _TRUNCATE, "%s/%s", folder, name);
+    char directory[MAX_PATH];
+    if (!ResolveWorldDirectory(folder, directory, sizeof(directory), false)) return false;
+    _snprintf_s(out, n, _TRUNCATE, "%s\\%s", directory, name);
     DWORD attr = GetFileAttributesA(out);
-    if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY)) return true;
-
-    if (_strnicmp(folder, "media_soviet/", 13) == 0 ||
-        _strnicmp(folder, "media_soviet\\", 13) == 0) return false;
-    _snprintf_s(out, n, _TRUNCATE, "media_soviet/%s/%s", folder, name);
-    attr = GetFileAttributesA(out);
     return attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
 }
 
@@ -1042,13 +1184,16 @@ static float ValueNoise(unsigned __int64 seed, int x, int y, int scale)
     return top + (bottom - top) * fy;
 }
 
-static BYTE ProceduralRichness(unsigned __int64 seed, int x, int y)
+static BYTE ProceduralRichness(unsigned __int64 seed, int x, int y, float offset)
 {
     float v = ValueNoise(seed, x, y, 128) * 0.50f +
               ValueNoise(seed ^ 0x51ed270b7d3a4c95ull, x, y, 64) * 0.27f +
               ValueNoise(seed ^ 0x94d049bb133111ebull, x, y, 32) * 0.15f +
               ValueNoise(seed ^ 0xbf58476d1ce4e5b9ull, x, y, 16) * 0.08f;
     const float threshold = 0.61f;
+    v += offset;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.0f) v = 1.0f;
     if (v <= threshold) return 0;
     float richness = (v - threshold) / (1.0f - threshold);
     richness = Smooth(richness);
@@ -1060,8 +1205,30 @@ extern "C" unsigned SmlDepositsNoiseChecksumForTest(unsigned __int64 seed)
 {
     unsigned hash = 2166136261u;
     for (int y = 0; y < 64; y++) for (int x = 0; x < 64; x++)
-        { hash ^= ProceduralRichness(seed, x * 16, y * 16); hash *= 16777619u; }
+        { hash ^= ProceduralRichness(seed, x * 16, y * 16, 0.0f); hash *= 16777619u; }
     return hash;
+}
+
+extern "C" unsigned SmlDepositsNoiseChecksumWithOffsetForTest(unsigned __int64 seed,
+                                                               float offset)
+{
+    unsigned hash = 2166136261u;
+    for (int y = 0; y < 64; y++) for (int x = 0; x < 64; x++)
+        { hash ^= ProceduralRichness(seed, x * 16, y * 16, offset); hash *= 16777619u; }
+    return hash;
+}
+
+extern "C" void SmlDepositsNoiseStatsForTest(unsigned __int64 seed, float offset,
+                                               unsigned __int64* sum, unsigned* nonzero)
+{
+    unsigned __int64 total = 0; unsigned count = 0;
+    for (int y = 0; y < 64; y++) for (int x = 0; x < 64; x++)
+    {
+        BYTE value = ProceduralRichness(seed, x * 16, y * 16, offset);
+        total += value; if (value) count++;
+    }
+    if (sum) *sum = total;
+    if (nonzero) *nonzero = count;
 }
 
 extern "C" int SmlDepositsShouldGenerateForTest(int manifestValid, int ddsExists,
@@ -1084,12 +1251,12 @@ static unsigned __int64 DepositSeed(const WorldDepositState* state, const Deposi
     return SmlMix64(seed);
 }
 
-static void FillGeneratedChannel(BYTE* data, int component, unsigned __int64 seed)
+static void FillGeneratedChannel(BYTE* data, int component, unsigned __int64 seed, float offset)
 {
     for (int y = 0; y < MAP_EDGE; y++) for (int x = 0; x < MAP_EDGE; x++)
     {
         size_t pixel = (size_t)y * MAP_EDGE + x;
-        data[128 + pixel * 4 + component] = ProceduralRichness(seed, x, y);
+        data[128 + pixel * 4 + component] = ProceduralRichness(seed, x, y, offset);
     }
 }
 
@@ -1099,7 +1266,7 @@ extern "C" int SmlDepositsChannelIsolationForTest(unsigned __int64 seed, int com
     BYTE* data = (BYTE*)malloc(DDS_BYTES);
     if (!data) return 0;
     memset(data, 0x5a, DDS_BYTES);
-    FillGeneratedChannel(data, component, seed);
+    FillGeneratedChannel(data, component, seed, 0.0f);
     bool changed = false, isolated = true;
     for (size_t pixel = 0; pixel < (size_t)MAP_EDGE * MAP_EDGE; pixel++)
         for (int c = 0; c < 4; c++)
@@ -1158,11 +1325,12 @@ static const char* BuildGeneratedMap(const char* folder, WorldDepositState* stat
         }
 
         unsigned __int64 seed = DepositSeed(state, d);
-        FillGeneratedChannel(data, d->component, seed);
+        FillGeneratedChannel(data, d->component, seed, d->richnessOffset);
         pending[d->type] = true;
-        Logf("maps     generated %-20s -> resourcemap%d component %d, fractal seed %016llx",
+        Logf("maps     generated %-20s -> resourcemap%d component %d, fractal seed %016llx, "
+             "richness_offset %+.3f, threshold 0.610",
              d->name, DEP_MAP_EXTRA + extraIndex + 1, d->component,
-             (unsigned long long)seed);
+             (unsigned long long)seed, d->richnessOffset);
         generated++;
     }
     if (!generated)
@@ -1174,8 +1342,8 @@ static const char* BuildGeneratedMap(const char* folder, WorldDepositState* stat
     }
 
     char fallbackRoot[MAX_PATH], media[MAX_PATH], tesmio[MAX_PATH], proc[MAX_PATH], world[MAX_PATH];
-    const char* vfsRoot = g_smlVfsRoot;
-    if (!vfsRoot[0])
+    const char* vfsRoot = g_vfsRoot;
+    if (!vfsRoot || !vfsRoot[0])
     {
         _snprintf_s(fallbackRoot, sizeof(fallbackRoot), _TRUNCATE, "%s\\vfs", g_baseDir);
         vfsRoot = fallbackRoot;
@@ -1217,11 +1385,21 @@ static void SanitizedName(const char* src, char* out, size_t n)
 
 static bool SaveWorldManifest(const char* folder, const WorldDepositState* state)
 {
-    char path[MAX_PATH], temp[MAX_PATH];
-    _snprintf_s(path, sizeof(path), _TRUNCATE, "%s/%s", folder, DEPOSIT_MANIFEST);
+    char directory[MAX_PATH], path[MAX_PATH], temp[MAX_PATH];
+    if (!ResolveWorldDirectory(folder, directory, sizeof(directory), true))
+    {
+        Logf("maps     manifest path rejected for \"%s\" (Win32 %lu)",
+             folder ? folder : "(null)", GetLastError());
+        return false;
+    }
+    _snprintf_s(path, sizeof(path), _TRUNCATE, "%s\\%s", directory, DEPOSIT_MANIFEST);
     _snprintf_s(temp, sizeof(temp), _TRUNCATE, "%s.tmp", path);
     FILE* f = NULL;
-    if (fopen_s(&f, temp, "wb") || !f) return false;
+    if (fopen_s(&f, temp, "wb") || !f)
+    {
+        Logf("maps     cannot create manifest temp %s (Win32 %lu)", temp, GetLastError());
+        return false;
+    }
     bool ok = fprintf(f, "[world]\r\nformat = %d\r\nseed = %016llx\r\n\r\n[deposits]\r\n",
                       MANIFEST_FORMAT, (unsigned long long)state->seed) > 0;
     for (int i = 0; ok && i < g_depCount; i++)
@@ -1237,8 +1415,11 @@ static bool SaveWorldManifest(const char* folder, const WorldDepositState* state
     if (fclose(f) != 0) ok = false;
     if (!ok || !MoveFileExA(temp, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
     {
+        DWORD error = GetLastError();
+        Logf("maps     failed replacing manifest %s (Win32 %lu)", path, error);
         DeleteFileA(temp); return false;
     }
+    Logf("maps     manifest persisted atomically: %s", path);
     return true;
 }
 
@@ -1445,7 +1626,8 @@ static void h_WorldSaveMaps(void* self, const char* folder)
 
 static void InstallExtraMaps()
 {
-    if (g_extraCount <= 0) return;
+    g_smlMapsReady = false;
+    if (g_extraCount <= 0) { g_smlMapsReady = true; return; }
 
     void** slot = FindIatSlot(g_exe, DLL_ENGINE, "?C3DHelp_CheckIfFileExist@@YA_NPEBD_N1@Z");
     if (slot) o_FileExists = (t_FileExists)*slot;
@@ -1463,13 +1645,15 @@ static void InstallExtraMaps()
         return;
     }
 
-    if (!PatchWorldSaveCall((void*)h_WorldSaveMaps))
+    bool saveHookReady = PatchWorldSaveCall((void*)h_WorldSaveMaps);
+    if (!saveHookReady)
         Logf("maps     WARN  the save hook did not install - extra maps load but are never "
              "written back, so painting and depletion will not survive a reload");
 
     BlankMapPath();      // written now rather than mid-load
     Logf("maps     %d map(s) past the engine's two are loaded and saved with the world",
          g_extraCount);
+    g_smlMapsReady = saveHookReady;
 }
 
 // Data below, code above. Both are bump-allocated and both are bounds-checked:
@@ -1710,7 +1894,7 @@ static bool PatchDepositType()
         memcmp(dispatchSite, kDispatchOrig, sizeof(kDispatchOrig)) != 0 ||
         memcmp(radiusSite,   kRadiusOrig,   sizeof(kRadiusOrig))   != 0)
     {
-        Logf("patch  site bytes differ from build v1.1.1.7 - refusing to patch");
+        Logf("patch  site bytes differ from build v1.1.1.9 - refusing to patch");
         return false;
     }
 
@@ -1724,7 +1908,7 @@ static bool PatchDepositType()
         (memcmp(mapOpenSite,  kMapOpenOrig,  sizeof(kMapOpenOrig))  != 0 ||
          memcmp(mapCloseSite, kMapCloseOrig, sizeof(kMapCloseOrig)) != 0))
     {
-        Logf("patch  resource-map bracket bytes differ from build v1.1.1.7 - "
+        Logf("patch  resource-map bracket bytes differ from build v1.1.1.9 - "
              "%d map deposit(s) dropped", g_mapCount);
         int kept = 0;
         for (int i = 0; i < g_depCount; i++)
@@ -1743,7 +1927,7 @@ static bool PatchDepositType()
         (memcmp(maskOpenSite,  kMaskOrig, sizeof(kMaskOrig)) != 0 ||
          memcmp(maskCloseSite, kMaskOrig, sizeof(kMaskOrig)) != 0))
     {
-        Logf("patch  terrain-mask bracket bytes differ from build v1.1.1.7 - "
+        Logf("patch  terrain-mask bracket bytes differ from build v1.1.1.9 - "
              "%d mask deposit(s) dropped", g_terrainCount);
         int kept = 0;
         for (int i = 0; i < g_depCount; i++)
@@ -1981,8 +2165,8 @@ static bool PatchDepositType()
 // and the region outlines, so it sits on top of them where the base game's own
 // layers sit underneath.
 
-#define P_MINIMAP_DRAW_RVA 0x4BDDE0   // FUN_1404bdde0 - draws the coloured overlay
-#define P_MINIMAP_ROW_RVA  0x4BFEA0   // FUN_1404bfea0 - draws + handles the button row
+#define P_MINIMAP_DRAW_RVA 0x4BDE80   // was 0x4BDDE0. FUN_1404bdde0 - draws the coloured overlay
+#define P_MINIMAP_ROW_RVA  0x4BFF40   // was 0x4BFEA0. FUN_1404bfea0 - draws + handles the button row
 
 static const BYTE kMinimapDrawPrologue[] = {
     0x48, 0x8B, 0xC4,                                 // mov rax,rsp
@@ -2003,11 +2187,18 @@ static const BYTE kMinimapRowPrologue[] = {
 };
 #define MINIMAP_ROW_STOLEN (sizeof(kMinimapRowPrologue))
 
-// Globals the vanilla functions already use, at the same addresses.
+// Globals the vanilla functions already use. v1.1.1.9 did not move .data at
+// all (confirmed for the game object, the resource vector and others via the
+// lea sites that resolve them - docs/02-findings.md), so every plain object
+// address below is unchanged. The .rdata layout-constant pool did move, by a
+// uniform -0x18 from G_PANEL_FULLSIZE through G_HALF; the three float4 tints
+// sit in a second cluster further out that moved by -0x20 instead - both
+// shifts confirmed by the VALUE at the new address, not assumed from the
+// first.
 #define G_GAMEOBJ         0x9941F0   // +0xED8 terrain, +0xF08 resourcemap2
 #define G_PANEL           0x9BE060   // the one C3D_PANEL2D the whole minimap draws through
 #define G_TECHNIQUE       0x9EAD08   // current shader technique, set by the last BeginDraw
-#define G_PANEL_FULLSIZE  0x909F70   // w/h passed to every Draw() call in this UI
+#define G_PANEL_FULLSIZE  0x909F58   // was 0x909F70. w/h passed to every Draw() call in this UI
 #define G_SLOT_BG_TEX     0x9DFF38   // background box texture, shared by every button
 #define G_SLOT_SEL_TEX    0x9E03E8   // "selected" badge texture, shared by every button
 #define G_CLICK_FLAG      0xA54E91   // nonzero for one frame on a real click
@@ -2016,19 +2207,19 @@ static const BYTE kMinimapRowPrologue[] = {
 #define G_RES_VECTOR      0x9E11C0   // the resource vector records live in: begin, end, capacity
 #define G_CLIP_HELPER_OBJ 0x9DFCC0   // passed to the per-icon clip-rect helper
 #define G_DPI             0x992088
-#define G_ROW_X0          0x90A9A0
-#define G_ROW_STEP        0x90AA5C
-#define G_ROW_Y0          0x90AB30
-#define G_ICON_SCALE      0x909E6C
-#define G_HITBOX_HALF     0x90A6C0
-#define G_BADGE_OFFSET    0x909CF0
+#define G_ROW_X0          0x90A988   // was 0x90A9A0
+#define G_ROW_STEP        0x90AA44   // was 0x90AA5C
+#define G_ROW_Y0          0x90AB18   // was 0x90AB30
+#define G_ICON_SCALE      0x909E54   // was 0x909E6C
+#define G_HITBOX_HALF     0x90A6A8   // was 0x90A6C0
+#define G_BADGE_OFFSET    0x909CD8   // was 0x909CF0
 // 0.5f. The vanilla code loads this one constant for two unrelated jobs: the
 // inset of the overlay quad inside the minimap panel, and the size of the
 // "selected" badge. Both uses below read it from here.
-#define G_HALF            0x909DF4
-#define G_COLOR_IDLE      0x90C120   // float4 tint, not hovered
-#define G_COLOR_HOVER     0x90C4E0   // float4 tint, hovered
-#define G_COLOR_OVERLAY   0x90C2F0   // float4 (1,0,0,1) - the red every deposit layer is drawn in
+#define G_HALF            0x909DDC   // was 0x909DF4
+#define G_COLOR_IDLE      0x90C100   // was 0x90C120. float4 tint, not hovered
+#define G_COLOR_HOVER     0x90C4C0   // was 0x90C4E0. float4 tint, hovered
+#define G_COLOR_OVERLAY   0x90C2D0   // was 0x90C2F0. float4 (1,0,0,1) - the red every deposit layer is drawn in
 
 // The minimap's hover text, and it needed no unexported formatter after all.
 // Every vanilla layer does exactly this when its icon is hovered:
@@ -2050,7 +2241,7 @@ static const BYTE kMinimapRowPrologue[] = {
 #define G_PANEL_PAD       0x9BE2F8
 #define G_PANEL_SIZE      0x9BE2E8   // 2 floats: w,h of the next Draw()
 #define G_PANEL_COLOR     0x9BE30C   // 4 floats: tint of the next Draw()
-#define P_CLIP_HELPER     0x446150   // FUN_140446150 - not exported, internal only
+#define P_CLIP_HELPER     0x4461F0   // was 0x446150. FUN_140446150 - not exported, internal only
 
 #define G_TECH_GET_HANDLE 0x50       // technique vtbl+0x50  GetConstantHandle(name)->handle
 #define G_TECH_SET_VEC    0x68       // technique vtbl+0x68  SetVectorConstant(handle, float4*)
@@ -2556,14 +2747,20 @@ static void InstallMinimapPatch()
 // Icons are loaded explicitly from "editor/tool_<name>.png", so a brush needs
 // nothing but two PNGs in the VFS named after its `editor` key.
 
-#define P_ED_PANEL_RVA    0x233110   // FUN_140233110 - draws the Resources tab
-#define P_ED_DISPATCH_RVA 0x30D100   // FUN_14030d100 - applies the active tool, every frame
-#define P_ED_CURSOR_RVA   0x2F0E70   // FUN_1402f0e70 - decides which tools get the round cursor
-#define P_ED_TEXELS_RVA   0x238B00   // FUN_140238b00 - the generic deposit texel writer
+// v1.1.1.9 rvas throughout; old values noted per line. The first four are
+// re-verified by their prologue at load. The last three are not - taken as raw
+// function pointers with no check, same as cities' P_RENUMBER/P_SLIDER - so
+// each was picked as the single unambiguous .pdata function start at the
+// local shift, and P_ED_TOOL_FIND's is additionally unchanged, sitting early
+// enough in .text that this update's growth all lands after it.
+#define P_ED_PANEL_RVA    0x233180   // was 0x233110. FUN_140233110 - draws the Resources tab
+#define P_ED_DISPATCH_RVA 0x30D1A0   // was 0x30D100. FUN_14030d100 - applies the active tool, every frame
+#define P_ED_CURSOR_RVA   0x2F0F10   // was 0x2F0E70. FUN_1402f0e70 - decides which tools get the round cursor
+#define P_ED_TEXELS_RVA   0x238B70   // was 0x238B00. FUN_140238b00 - the generic deposit texel writer
 
-#define P_ED_TOOL_FIND    0x03AAA0   // FUN_14003aaa0 - tool lookup by name
-#define P_ED_DRAW_BUTTON  0x3826C0   // FUN_1403826c0 - draws one tool button
-#define P_ED_PAINT        0x2350D0   // FUN_1402350d0 - one brush tick for one deposit
+#define P_ED_TOOL_FIND    0x03AAA0   // unchanged. FUN_14003aaa0 - tool lookup by name
+#define P_ED_DRAW_BUTTON  0x382760   // was 0x3826C0. FUN_1403826c0 - draws one tool button
+#define P_ED_PAINT        0x235140   // was 0x2350D0. FUN_1402350d0 - one brush tick for one deposit
 
 // Editor object fields.
 #define ED_ACTIVE_TOOL    0xD428     // char* - the descriptor of the selected tool
@@ -2595,7 +2792,7 @@ static void InstallMinimapPatch()
 // 0x383BD0 before it returns, which is before an appended hook has drawn
 // anything, and our accumulator went nowhere. Calling the consumer ourselves,
 // once, after our own buttons, is the whole fix.
-#define P_ED_TOOLTIP      0x383BD0   // FUN_140383bd0(editorSelf, hoveredTool)
+#define P_ED_TOOLTIP      0x383C70   // was 0x383BD0. FUN_140383bd0(editorSelf, hoveredTool)
 
 // Engine globals and vtable slots the icon needs.
 #define G_MIDDLEPOINT     0x9EACD0   // C3D_MIDDLEPOINT the button drawer creates textures through
@@ -2603,13 +2800,16 @@ static void InstallMinimapPatch()
 
 // Resources-tab layout, all floats in .rdata, all read from the game so a
 // patch release that moves the grid moves our buttons with it.
-#define G_ED_X_A          0x90AA40   // 50
-#define G_ED_X_B          0x90AB2C   // 85
-#define G_ED_Y_BASE       0x90ADD0   // 250
-#define G_ED_Y_CAPTION    0x90AB14   // 80
-#define G_ED_BUTTON       0x909EEC   // 0.85, the size argument every button is drawn with
-#define G_ED_ROW_STEP     0x90AB44   // 90, paint row to erase row
-#define G_ED_COL_STEP     0x90AB9C   // 105, resource to resource
+// v1.1.1.9; .rdata layout pool moved -0x18, each value confirmed at its new
+// address. Old addresses: 0x90AA40, 0x90AB2C, 0x90ADD0, 0x90AB14, 0x909EEC,
+// 0x90AB44, 0x90AB9C respectively.
+#define G_ED_X_A          0x90AA28   // 50
+#define G_ED_X_B          0x90AB14   // 85
+#define G_ED_Y_BASE       0x90ADB8   // 250
+#define G_ED_Y_CAPTION    0x90AAFC   // 80
+#define G_ED_BUTTON       0x909ED4   // 0.85, the size argument every button is drawn with
+#define G_ED_ROW_STEP     0x90AB2C   // 90, paint row to erase row
+#define G_ED_COL_STEP     0x90AB84   // 105, resource to resource
 
 #define ED_IDX_BAUXITE    4          // 0x2350D0's index, not the channel
 #define ED_CH_BAUXITE     6          // what that index becomes by the time it reaches 0x238B00
@@ -2630,17 +2830,18 @@ static void InstallMinimapPatch()
 // Two functions, one constant apart, and the channel encoding is the deposit
 // brush's: channel = (component + 1) & 3. So rock paints component 2, which is
 // exactly the component gravel is mined from.
-#define P_ED_ROCKS_PANEL  0x22EE30   // FUN_14022ee30 - draws the Rocks tab
-#define P_ED_PAINT_ROCK   0x235300   // FUN_140235300 - one rock brush tick
+#define P_ED_ROCKS_PANEL  0x22EEA0   // was 0x22EE30. FUN_14022ee30 - draws the Rocks tab
+#define P_ED_PAINT_ROCK   0x235370   // was 0x235300. FUN_140235300 - one rock brush tick
 #define ED_CH_ROCK        3          // the EditMask channel that call passes
 
 // Rocks-tab layout, all read from the game for the same reason the Resources
 // tab's are. x = DPI*(50 + 85), y = DPI*(250 + 80), one button 0.85 wide, and
 // 85 apart across; the mod row sits one 90-step below the vanilla one.
-#define G_ED_ROCK_X_A     0x90AA40   // 50
-#define G_ED_ROCK_X_B     0x90AB2C   // 85 - and the step between buttons
-#define G_ED_ROCK_Y_BASE  0x90ADD0   // 250
-#define G_ED_ROCK_Y_CAP   0x90AB14   // 80
+// v1.1.1.9; same -0x18 pool as the Resources tab above.
+#define G_ED_ROCK_X_A     0x90AA28   // 50
+#define G_ED_ROCK_X_B     0x90AB14   // 85 - and the step between buttons
+#define G_ED_ROCK_Y_BASE  0x90ADB8   // 250
+#define G_ED_ROCK_Y_CAP   0x90AAFC   // 80
 
 static const BYTE kEdPanelPrologue[] = {
     0x48, 0x8B, 0xC4,                                  // mov rax,rsp
@@ -3112,10 +3313,12 @@ static void h_ED_Cursor(void* self)
 // reads at whichever texture this deposit actually lives in, let the engine
 // draw its own overlay, and put all of it back.
 
-#define P_ED_TERRAIN_RVA  0xAEE0     // FUN_14000aee0 - contour lines and the resource overlay
+#define P_ED_TERRAIN_RVA  0xAEE0     // unchanged in v1.1.1.9. FUN_14000aee0 - contour lines and the resource overlay
 #define G_OVL_FLAGS       0x23       // gameobj, six bytes, one per paintable channel
 #define G_OVL_COUNT       6
-#define G_OVL_VEC_C2      0x90BDF0   // the float4 the +0x23 branch passes: (0,0,1,0)
+#define G_OVL_VEC_C2      0x90BDD0   // was 0x90BDF0 - the float4 the +0x23 branch passes: (0,0,1,0).
+                                     // A further .rdata cluster, confirmed at -0x20 rather than
+                                     // the -0x18 above - see G_COLOR_OVERLAY
 
 static const BYTE kEdTerrainPrologue[] = {
     0x48, 0x8B, 0xC4,                   // mov rax,rsp
@@ -3375,6 +3578,10 @@ static const char* svc_Setting(int i, const char* key)
 
 static const TsmDepositApi kDepositApi = { svc_Count, svc_Get, svc_Setting, svc_Texture };
 
+extern "C" int SmlDepositsDeclaredCount(void) { return g_depCount; }
+extern "C" int SmlDepositsPatchReady(void) { return g_smlPatchReady ? 1 : 0; }
+extern "C" int SmlDepositsMapsReady(void) { return g_smlMapsReady ? 1 : 0; }
+
 extern "C" unsigned TsmPluginApiVersion(void)
 {
     return TSM_API_VERSION;
@@ -3385,6 +3592,8 @@ extern "C" int TsmPluginInit(const TsmHost* host, TsmPluginInfo* info)
     TsmBind(host);
     info->name    = "deposits";
     info->version = "1.1";
+    g_smlPatchReady = false;
+    g_smlMapsReady = false;
 
     const char* ini = "plugins\\deposits.ini";
     g_depositPatch = H->configInt(ini, "deposits", "code_patch", g_depositPatch);
@@ -3402,7 +3611,8 @@ extern "C" int TsmPluginInit(const TsmHost* host, TsmPluginInfo* info)
     // Does nothing at all unless a section named a map past the engine's two.
     InstallExtraMaps();
 
-    if (g_depositPatch) PatchDepositType();
+    if (g_depositPatch) g_smlPatchReady = PatchDepositType();
+    else g_smlPatchReady = g_depCount == 0;
     if (g_minimapPatch) InstallMinimapPatch();
     if (g_editorPatch)  InstallEditorPatch();
 

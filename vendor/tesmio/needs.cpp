@@ -64,16 +64,17 @@
 // demand is cloned from that resource's demand, and the storage slot is added
 // to exactly those storages that already stock it.
 //
-// Everything here is addresses for SOVIET64.exe v1.1.1.7. See docs/11-needs.md.
+// Everything here is addresses for SOVIET64.exe v1.1.1.9. See docs/11-needs.md.
 
 #include "tesmio_plugin.h"
 
 // ---------------------------------------------------------------- the game
 
-#define P_PERSON_PLAN_RVA   0x836960   // FUN_140836960(game, person)
+#define P_PERSON_PLAN_RVA   0x836B40   // v1.1.1.9; was 0x836960
 #define P_STORAGE_BUILD_RVA 0x0E40F0   // FUN_1400e40f0(parser, storage, class, cap, res)
-#define P_SHOP_TICK_RVA     0x171DA0   // FUN_140171da0(game, building) - building type 3
-#define P_TYPE_LOAD_RVA     0x11D810   // FUN_14011d810 - "Initializing vanilla buildling types"
+#define P_SHOP_TICK_RVA     0x171E10   // v1.1.1.9; was 0x171DA0. Building type 3
+#define P_TYPE_LOAD_RVA     0x11D800   // v1.1.1.9; was 0x11D810 - one of the few
+                                       // sites that moved DOWN, see docs/02-findings.md
 #define P_BUILDING_TYPES    0x9E6A30   // the vector<TYPE> that function fills
 // Not a vector of pointers - a vector of the objects themselves, stride 0xBE8.
 // The clear() at 0x1FF240 walks it with `lVar2 = lVar2 + 0xbe8`, and a live
@@ -255,6 +256,10 @@ struct Need
 
 static Need g_need[MAX_NEEDS];
 static int  g_needCount;
+static bool g_smlNeedsHooksReady;
+
+extern "C" int SmlNeedsDeclaredCount(void) { return g_needCount; }
+extern "C" int SmlNeedsHooksReady(void) { return g_smlNeedsHooksReady ? 1 : 0; }
 
 static int   g_enabled    = 1;
 static int   g_doDemand   = 1;     // add the need to citizens
@@ -1552,6 +1557,7 @@ extern "C" int TsmPluginInit(const TsmHost* host, TsmPluginInfo* info)
 
 extern "C" int TsmPluginStart(void)
 {
+    g_smlNeedsHooksReady = false;
     if (!g_enabled) return 1;
 
     o_SlotPush     = (t_SlotPush)(g_exeBase + P_SLOT_PUSH_RVA);
@@ -1631,6 +1637,8 @@ extern "C" int TsmPluginStart(void)
         Logf("needs    nothing hooked - inactive");
         return 1;
     }
+
+    g_smlNeedsHooksReady = g_doDemand && g_doStorage;
 
     for (int i = 0; i < g_needCount; i++)
         Logf("needs    %-18s like \"%s\" x%.2f, %s storages, chance %.2f, "
