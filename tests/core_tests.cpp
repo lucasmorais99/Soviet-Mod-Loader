@@ -193,6 +193,14 @@ int main() {
     CHECK(generatedDeposits.get("automatic_ore", "component").empty());
     CHECK(std::filesystem::is_regular_file(base / "soviet_mod_loader/catalog.ini"));
 
+    Put(root / "media_soviet/save/test-world/save.bin", "save-data");
+    std::filesystem::path backupPath; std::string backupFailure;
+    CHECK(BackupSavedGames(&backupPath, &backupFailure));
+    std::string backedUpSave;
+    CHECK(ReadText(backupPath / "test-world/save.bin", backedUpSave));
+    CHECK(backedUpSave == "save-data");
+    CHECK(backupPath.parent_path() == root / "media_soviet/save_backups");
+
     // richness_offset is validated before the application phase.
     std::string validDepositPlan;
     for (auto& plan : g_domainPlans) if (plan.domain == "deposits") {

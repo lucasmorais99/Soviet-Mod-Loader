@@ -1,153 +1,149 @@
-# Guia do usuário
+# User guide
 
-O Soviet Mod Loader (SML) carrega mods compatíveis diretamente da Steam
-Workshop. Ele reúne em uma única DLL o suporte a construções, recursos,
-depósitos e necessidades. Não é necessário instalar esses quatro plugins
-separadamente.
+Soviet Mod Loader (SML) loads compatible mods directly from the Steam Workshop.
+One DLL provides building, resource, deposit, and need support; the four
+standalone plugins are not required.
 
-## Antes de instalar
-
-Esta versão requer:
+## Requirements
 
 - *Workers & Resources: Soviet Republic* v1.1.1.9;
 - TesmioLoader b0.3.6;
 - Windows.
 
-O jogo deve ser iniciado pelo `tesmiolauncher.exe`, não pelo botão normal da
-Steam. Faça backup dos saves importantes antes de alterar um conjunto de mods.
+Launch the game with `tesmiolauncher.exe`, not directly from Steam. Keep a
+separate copy of important saves before changing a mod set.
 
-## Instalação
+## Installation
 
-1. Feche o jogo.
-2. Abra a pasta `tesmioloader/build/plugins`.
-3. Se existirem, apague `000_soviet_mod_loader.dll` e
-   `000_soviet_mod_loader.ini`.
-4. Remova ou desative DLLs separadas chamadas `buildings.dll`, `resources.dll`,
-   `deposits.dll` e `needs.dll`.
-5. Copie `soviet_mod_loader.dll` e `soviet_mod_loader.ini` para essa pasta.
-6. Abra o `tesmiolauncher.exe`, habilite o SML se a lista de plugins for
-   exibida e inicie o jogo.
+1. Close the game.
+2. Open `tesmioloader/build/plugins`.
+3. Delete old `000_soviet_mod_loader.dll` and `000_soviet_mod_loader.ini`
+   files if present.
+4. Remove or disable standalone `buildings.dll`, `resources.dll`,
+   `deposits.dll`, and `needs.dll` copies.
+5. Copy `soviet_mod_loader.dll` and `soviet_mod_loader.ini` into the folder.
+6. Open `tesmiolauncher.exe`, enable SML if a plugin list is displayed, and
+   start the game.
 
-Não renomeie a DLL para recolocar `000_`. A ordem alfabética deixou de ser um
-requisito: o TesmioLoader separa as fases `Init` e `Start`, e o SML controla
-internamente seus componentes.
+Do not rename the DLL to restore the `000_` prefix. TesmioLoader separates
+`Init` and `Start`, and SML controls the order of its embedded components.
 
-## Uso normal
+## Normal workflow
 
-Inscreva-se em um mod compatível pela Workshop e inicie pelo launcher. O SML:
+Subscribe to a compatible Workshop item and launch through TesmioLoader. SML:
 
-1. encontra os mods instalados;
-2. verifica versões e dependências;
-3. define uma ordem estável;
-4. mostra conflitos ou incompatibilidades;
-5. pede confirmação antes de alterar arquivos;
-6. combina o conteúdo e inicia o jogo.
+1. discovers installed mods;
+2. validates versions and dependencies;
+3. establishes a stable load order;
+4. plans conflicts, catalogs, INIs, and assets in memory;
+5. validates resource references and building donors;
+6. asks for confirmation when required;
+7. applies the accepted plan and validates its runtime components.
 
-Antes de mostrar a confirmação, o SML verifica se buildings, deposits e needs
-apontam para resources existentes e se cada donor de building possui os arquivos
-essenciais. Depois da confirmação, ele confere se os quatro componentes realmente
-registraram tudo e instalaram os patches necessários. Uma falha crítica encerra
-o processo com uma mensagem, em vez de deixar o jogo abrir com ponteiros nulos.
+The first run, or a change to the list, order, version, fingerprint, or state,
+opens a native confirmation dialog. Choose **Load mods and start** to continue.
+Declining, closing the dialog, or pressing Escape exits without applying the
+new plan.
 
-Na primeira execução ou quando a lista, ordem, versão ou estado mudar, uma
-janela mostra os mods que serão carregados. Escolha **Carregar mods e iniciar**
-para continuar. Recusar, fechar a janela ou pressionar `Esc` encerra o jogo sem
-aplicar o novo plano.
+### Save backup option
 
-A opção `confirmation_mode` em `soviet_mod_loader.ini` aceita:
+The confirmation dialog includes **Back up my saved games before loading
+mods**, selected by default. When accepted, SML copies the complete folder:
 
-- `changes` (padrão): pergunta somente quando algo mudou;
-- `always`: pergunta em todo início;
-- `never`: não mostra janela; útil para execução automatizada ou recuperação
-  em ambientes sem interface.
+```text
+SovietRepublic/media_soviet/save
+```
 
-## Estados apresentados
+to a timestamped directory such as:
 
-| Estado | Significado |
+```text
+SovietRepublic/media_soviet/save_backups/SML-20260816-143000
+```
+
+The backup runs before SML changes INIs, catalogs, assets, plugin settings, or
+hooks. If it fails, SML displays an English error and closes the game without
+applying the plan. When the Task Dialog is unavailable, the MessageBox fallback
+uses the safe default and creates the backup after the user selects Yes.
+
+No backup is created when the confirmation is skipped because nothing changed,
+or when `confirmation_mode = never` is configured.
+
+## Confirmation policy
+
+`confirmation_mode` in `soviet_mod_loader.ini` accepts:
+
+- `changes` (default): ask only when the resolved mod configuration changes;
+- `always`: ask on every launch;
+- `never`: never show a dialog, intended for unattended runs or UI recovery.
+
+## Mod states
+
+| State | Meaning |
 |---|---|
-| active/added | será carregado |
-| conflict | será carregado, mas algum conteúdo foi substituído por um mod posterior |
-| disabled | o autor ou usuário o desativou no manifesto |
-| incompatible | não aceita a API atual do TesmioLoader |
-| missing dependency | depende de outro mod ausente ou em versão inadequada |
-| error | manifesto ou conteúdo inválido; os demais mods continuam |
+| active / added | The mod will load. |
+| conflict | The mod loads, but later content replaced one of its entries. |
+| disabled | The manifest disabled the mod. |
+| incompatible | The mod does not accept the current TesmioLoader API. |
+| missing dependency | A required mod or compatible version is absent. |
+| error | The manifest or content is invalid. |
 
-Conflitos usam a política “o último vence”. Dependências vêm primeiro; depois
-são considerados prioridade, data de adição e ID do mod.
+Dependencies load first. Priority, Workshop addition time, and mod ID then
+provide deterministic ordering. Later entries win individual conflicts.
 
-## Aviso sobre `workshop_wip`
+## `workshop_wip` safety warning
 
-Antes da confirmação, o SML compara o catálogo planejado com pastas numéricas
-de `media_soviet/workshop_wip` no intervalo `9100000000`–`9199999999`. Uma
-pasta inesperada ou com identificação incorreta pode fazer o jogo crashar.
+Before confirmation, SML compares planned building IDs with numeric folders in
+`media_soviet/workshop_wip` from `9100000000` through `9199999999`. An unknown
+folder, missing stamp, or mismatched stamp can crash the game.
 
-Nesse caso, o SML mostra as pastas problemáticas e impede o início. Feche o
-jogo e apague **somente as pastas listadas na mensagem**; depois tente de novo.
-O SML nunca as apaga automaticamente. Não remova outras pastas WIP sem saber a
-origem delas.
+SML lists unsafe folders and blocks startup. Delete only the folders named in
+the message, then launch again. SML never deletes them automatically.
 
-## Atualização
+## Updates and removal
 
-1. Feche o jogo.
-2. Apague a DLL e o INI antigos com prefixo `000_`, caso ainda existam.
-3. Substitua `soviet_mod_loader.dll` e, se desejado, atualize o INI preservando
-   suas escolhas.
-4. Não apague a pasta `tesmioloader/build/soviet_mod_loader`.
-5. Inicie pelo launcher e confirme o novo conjunto.
+To update, close the game, replace the DLL, optionally merge new INI comments,
+and relaunch. Preserve `tesmioloader/build/soviet_mod_loader`: its append-only
+catalog keeps save-facing building IDs, deposit types, and list positions
+stable. Managed assets belong in the real `tesmioloader/vfs`, never
+`tesmioloader/build/vfs`.
 
-A pasta de estado `tesmioloader/build/soviet_mod_loader` contém o catálogo
-permanente. Apagá-la pode mudar números internos usados por saves e mods.
-Assets gerenciados são colocados no diretório real `tesmioloader/vfs`, nunca
-em `tesmioloader/build/vfs`.
+To remove SML, close the game and remove its DLL and INI. Saves containing SML
+resources, needs, deposits, or buildings may still require the same mod set;
+restore a backup if they cannot load safely.
 
-## Remoção
+## Troubleshooting
 
-Feche o jogo e remova `soviet_mod_loader.dll` e seu INI de
-`tesmioloader/build/plugins`. Preserve os saves. Mods que acrescentam recursos,
-necessidades, depósitos ou construções podem deixar esses saves dependentes do
-mesmo conjunto; volte ao backup se o jogo não conseguir abri-los sem o SML.
+**The confirmation appears every time:** verify `confirmation_mode = changes`
+and check whether Workshop files are being modified continuously.
 
-## Solução de problemas
+**The game closes after declining:** this is expected; the new plan was not
+applied.
 
-**A janela aparece em todo início:** confirme se `confirmation_mode = changes`
-e se a Workshop não está atualizando algum item continuamente.
+**The backup fails:** check free space and permissions for
+`media_soviet/save_backups`. The error and destination are also written to
+`tesmioloader.log`.
 
-**O jogo fecha ao recusar:** é o comportamento esperado; nenhum novo merge ou
-hook é aplicado.
+**Startup lists WIP folders:** delete only the listed folders and retry.
 
-**O jogo não inicia e lista pastas WIP:** apague somente as pastas indicadas e
-tente novamente.
+**A resource is not registered:** a building, deposit, or need references an
+absent resource. Update or remove the offending mod; do not work around the
+block by lowering the resources hook mode.
 
-**A mensagem cita um resource não registrado:** o mod declarou um building,
-deposit ou need que usa um resource ausente. Atualize ou remova o mod apontado;
-não tente contornar o bloqueio reduzindo `hook` para `1`.
+**A donor, `.nmf`, or `.mtl` is missing:** the generated building would be
+incomplete. Its author must use a complete donor compatible with this game
+version.
 
-**A mensagem cita donor, `.nmf` ou `.mtl`:** o building ficou incompleto. O
-autor precisa escolher um donor íntegro ou fornecer uma definição compatível.
+**The log says a DDS was generated but startup is blocked:** DDS generation,
+texture loading, resource registration, and building validation are separate
+stages. A generated map cannot make a missing resource pointer safe.
 
-**O log diz `DDS gerado`, mas o jogo foi bloqueado:** geração, carregamento da
-textura, registro do resource e validação do building são etapas diferentes.
-O DDS sozinho não torna segura uma produção cujo resource não foi registrado.
+**Deposit richness changes only in new worlds:** mod authors may declare
+`richness_offset`, but it applies only when SML creates a new channel. Existing
+channels are preserved to protect painting and depletion data.
 
-**O manifesto de depósitos não é salvo:** confira no log o caminho físico e o
-código de erro do Windows. `saved_last`, `campaign1` e `save\<mundo>` são
-resolvidos dentro de `media_soviet`; caminhos externos e `..` são recusados.
+**Version or prologue error:** the game was probably updated. Install a matching
+SML release instead of forcing the hook.
 
-**A riqueza de um depósito mudou apenas em mundos novos:** isso é esperado.
-Autores podem declarar `richness_offset`, mas o SML aplica o balanceamento
-somente quando cria um canal novo. Canais já salvos não são regenerados, pois
-isso apagaria pintura e depleção existentes.
-
-**Há erro de versão ou prólogo:** o jogo provavelmente foi atualizado. Não
-force o carregamento; instale uma versão do SML compatível.
-
-**Mods aparecem como incompatíveis:** confira dependências e se o manifesto do
-mod aceita API 4.
-
-**Há crash ou comportamento duplicado:** confirme que não existem
-`000_soviet_mod_loader.dll`, uma segunda cópia do SML ou DLLs standalone de
-`buildings`, `resources`, `deposits` e `needs`.
-
-Para pedir suporte, envie `tesmioloader.log` e
-`tesmioloader/build/soviet_mod_loader/report.json`, além da versão do jogo, do loader
-e do SML. Não publique saves pessoais sem verificar seu conteúdo.
+For support, provide `tesmioloader.log`,
+`tesmioloader/build/soviet_mod_loader/report.json`, and the exact game,
+TesmioLoader, and SML versions. Review personal saves before sharing them.
