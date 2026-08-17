@@ -43,8 +43,11 @@ flowchart LR
     D --> P[Plan merges/assets, enforce invariants, validate references]
     P --> Q{Changed set accepted?}
     Q -->|No| X[Exit before application]
-    Q -->|Yes| E[Apply four INI merges]
-    Q -->|Yes| F[Incremental VFS asset sync]
+    Q -->|Yes, backup checked| S[Copy media_soviet/save to timestamped backup]
+    S --> E[Apply four INI merges]
+    S --> F[Incremental VFS asset sync]
+    Q -->|Yes, backup unchecked| E
+    Q -->|Yes, backup unchecked| F
     E --> G[Embedded resources/deposits/needs/buildings Init]
     F --> G
     G --> V{Runtime catalogs and hooks valid?}
@@ -65,6 +68,15 @@ base snapshots, merged INIs, catalogs, assets, embedded components, or child
 hooks are applied. `always` prompts every launch and `never` explicitly opts
 out. Task Dialog is preferred for expandable details, with MessageBox as the
 compatibility fallback.
+
+The Task Dialog includes a verification checkbox to back up saved games,
+checked by default. After acceptance and before any application, the complete
+`media_soviet/save` tree is copied to a fresh
+`media_soviet/save_backups/SML-YYYYMMDD-HHMMSS[-N]` directory. A missing source
+is a successful no-op. Any copy failure displays an English blocking error and
+terminates before INIs, catalogs, assets, plugin settings, or hooks change. The
+MessageBox fallback uses the checked default because it cannot render a
+checkbox.
 
 Before that confirmation, the loader compares the planned building IDs with
 directories in `media_soviet/workshop_wip` whose numeric names fall in the

@@ -1,53 +1,55 @@
 # Soviet Mod Loader
 
-O Soviet Mod Loader (SML) 0.5.2 é um plugin único para o TesmioLoader que descobre,
-ordena e combina mods diretamente da Steam Workshop. A DLL incorpora as
-funcionalidades de `buildings`, `resources`, `deposits` e `needs`; portanto, o
-usuário não precisa instalar esses plugins separadamente.
+Soviet Mod Loader (SML) 0.6.0 is a single TesmioLoader plugin that discovers,
+orders, and merges compatible mods directly from the Steam Workshop. The DLL
+includes the `buildings`, `resources`, `deposits`, and `needs` capabilities, so
+users must not install those plugins separately.
 
-Esta versão acompanha o TesmioLoader b0.3.6, usa a API 4 e é destinada ao
-*Workers & Resources: Soviet Republic* v1.1.1.9. O TesmioLoader distribuído
-fornece a infraestrutura de carregamento; o SML fornece, em uma única DLL, o
-fluxo de conteúdo adotado por este projeto.
+This release targets TesmioLoader b0.3.6/API 4 and *Workers & Resources: Soviet
+Republic* v1.1.1.9. TesmioLoader provides the plugin host and VFS; SML provides
+the centralized mod-content workflow.
 
-## Escolha seu guia
+## Documentation
 
-- [Guia do mantenedor](docs/GUIA_MANTENEDOR.md): sincronização com o upstream,
-  arquitetura, build, testes e publicação.
-- [Guia do usuário](docs/GUIA_USUARIO.md): instalação, atualização, confirmação
-  de mods e solução de problemas.
-- [Guia para desenvolvedores de mods](docs/GUIA_MODDERS.md): manifesto,
-  fragmentos INI, assets, dependências e hooks nativos.
+- [Maintainer guide](docs/GUIA_MANTENEDOR.md): architecture, upstream sync,
+  builds, tests, diagnostics, and releases.
+- [User guide](docs/GUIA_USUARIO.md): installation, mod confirmation, save
+  backups, updates, and troubleshooting.
+- [Mod developer guide](docs/GUIA_MODDERS.md): manifests, INI fragments,
+  assets, dependencies, deposit generation, and native hooks.
+- [Architecture reference](docs/ARCHITECTURE.md): internal data flow and
+  compatibility boundaries.
 
-A referência interna mais detalhada está em
-[Arquitetura](docs/ARCHITECTURE.md). Um mod mínimo funcional está em
-[`template/simple-mod`](template/simple-mod).
+A complete starter mod is available under [`template/simple-mod`](template/simple-mod).
 
-## Instalação rápida
+## Quick installation
 
-1. Feche o jogo e apague versões antigas chamadas
-   `000_soviet_mod_loader.dll` e `000_soviet_mod_loader.ini`.
-2. Copie `soviet_mod_loader.dll` e `soviet_mod_loader.ini` para
+1. Close the game and remove old `000_soviet_mod_loader.dll` and
+   `000_soviet_mod_loader.ini` files.
+2. Copy `soviet_mod_loader.dll` and `soviet_mod_loader.ini` to
    `tesmioloader/build/plugins`.
-3. Não instale DLLs separadas de `buildings`, `resources`, `deposits` ou
-   `needs` junto com o SML.
-4. Inicie pelo `tesmiolauncher.exe`.
+3. Remove or disable standalone `buildings.dll`, `resources.dll`,
+   `deposits.dll`, and `needs.dll` copies.
+4. Launch the game through `tesmiolauncher.exe`.
 
-O SML não depende mais dos INIs que acompanhavam os plugins standalone. Quando
-há conteúdo, ele impõe internamente o modo funcional mínimo de `resources`,
-`deposits`, `needs` e `buildings`. Antes de iniciar, também verifica referências
-entre esses quatro catálogos e interrompe a carga se um resource, donor ou asset
-essencial estiver ausente.
+The historical `000_` prefix is no longer used. Keeping both DLL names in the
+same installation can load duplicate logic.
 
-O prefixo `000_` não é mais utilizado. Nunca mantenha as duas DLLs na mesma
-instalação: ambas seriam descobertas e poderiam instalar lógica duplicada.
+SML does not depend on the configuration files formerly shipped with the four
+standalone plugins. When content requires a capability, SML enforces its safe
+operating mode internally. It validates cross-catalog references before
+applying files and validates the actual component registrations and hooks
+before allowing the game to continue.
 
-## Fontes upstream
+When the mod configuration changes, the confirmation dialog offers to back up
+saved games before loading the new set. This option is selected by default.
+Backups are written below `media_soviet/save_backups`.
 
-O contrato de integração vem do
-[TesmioLoader](https://github.com/MaxLegend/TesmioLoader), em especial da
-[API pública](https://github.com/MaxLegend/TesmioLoader/blob/master/src/tesmio_api.h),
-da [documentação de plugins](https://github.com/MaxLegend/TesmioLoader/blob/master/docs/09-plugins.md)
-e do [changelog](https://github.com/MaxLegend/TesmioLoader/blob/master/changelog.md).
-As adaptações e diferenças intencionais estão documentadas no guia do
-mantenedor e no `NOTICE.md`.
+## Upstream sources
+
+The integration contract comes from
+[TesmioLoader](https://github.com/MaxLegend/TesmioLoader), particularly its
+[public API](https://github.com/MaxLegend/TesmioLoader/blob/master/src/tesmio_api.h),
+[plugin documentation](https://github.com/MaxLegend/TesmioLoader/blob/master/docs/09-plugins.md),
+and [changelog](https://github.com/MaxLegend/TesmioLoader/blob/master/changelog.md).
+Intentional adaptations are documented in the maintainer guide and `NOTICE.md`.

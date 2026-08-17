@@ -1040,7 +1040,8 @@ static void ShowValidationFailure(const std::vector<std::string>& errors, bool a
                 MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST);
 }
 
-static bool ConfirmModsWithUser() {
+static bool ConfirmModsWithUser(bool* backupSaves) {
+    if (backupSaves) *backupSaves = true;
     int usable = 0, warnings = 0;
     std::ostringstream details;
     details << "MODS TO BE LOADED\r\n";
@@ -1075,15 +1076,21 @@ static bool ConfirmModsWithUser() {
     t_TaskDialogIndirect taskDialog = common ? (t_TaskDialogIndirect)GetProcAddress(common, "TaskDialogIndirect") : nullptr;
     if (taskDialog) {
         TASKDIALOGCONFIG cfg{}; cfg.cbSize = sizeof(cfg); cfg.hInstance = GetModuleHandleW(nullptr);
-        cfg.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | TDF_USE_COMMAND_LINKS | TDF_SIZE_TO_CONTENT;
+        cfg.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | TDF_USE_COMMAND_LINKS |
+                      TDF_SIZE_TO_CONTENT | TDF_VERIFICATION_FLAG_CHECKED;
         cfg.pszWindowTitle = title.c_str(); cfg.pszMainIcon = warnings ? TD_WARNING_ICON : TD_INFORMATION_ICON;
         cfg.pszMainInstruction = instruction.c_str(); cfg.pszContent = content.c_str();
         cfg.cButtons = (UINT)(sizeof(buttons) / sizeof(buttons[0])); cfg.pButtons = buttons; cfg.nDefaultButton = 1001;
         cfg.pszExpandedInformation = expanded.c_str(); cfg.pszExpandedControlText = L"Show details";
         cfg.pszCollapsedControlText = L"Hide details";
-        int pressed = IDCANCEL; HRESULT hr = taskDialog(&cfg, &pressed, nullptr, nullptr);
+        cfg.pszVerificationText = L"Back up my saved games before loading mods";
+        int pressed = IDCANCEL; BOOL checked = TRUE;
+        HRESULT hr = taskDialog(&cfg, &pressed, nullptr, &checked);
         if (owned) FreeLibrary(common);
-        if (SUCCEEDED(hr)) return pressed == 1001;
+        if (SUCCEEDED(hr)) {
+            if (backupSaves) *backupSaves = checked != FALSE;
+            return pressed == 1001;
+        }
     } else if (owned) FreeLibrary(common);
 
     std::wstring fallback = instruction + L"\r\n\r\n" + content + L"\r\n\r\n" + expanded +
@@ -1091,6 +1098,57 @@ static bool ConfirmModsWithUser() {
     int answer = MessageBoxW(nullptr, fallback.c_str(), title.c_str(),
                              MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON1 | MB_SETFOREGROUND | MB_TOPMOST);
     return answer == IDYES;
+}
+
+static bool BackupSavedGames(fs::path* destination, std::string* failure) {
+    fs::path source = GameRoot() / "media_soviet" / "save";
+    std::error_code ec;
+    if (!fs::exists(source, ec)) {
+        H->log("sml       save backup skipped: %s does not exist", PathUtf8(source).c_str());
+        if (destination) destination->clear();
+        return true;
+    }
+    if (ec || !fs::is_directory(source, ec)) {
+        if (failure) *failure = "The save path is unavailable or is not a directory: " + PathUtf8(source);
+        return false;
+    }
+
+    SYSTEMTIME now{}; GetLocalTime(&now);
+    char stamp[48];
+    _snprintf_s(stamp, sizeof(stamp), _TRUNCATE, "SML-%04u%02u%02u-%02u%02u%02u",
+                now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond);
+    fs::path root = GameRoot() / "media_soviet" / "save_backups";
+    fs::create_directories(root, ec);
+    if (ec) {
+        if (failure) *failure = "Unable to create the save backup directory: " +
+                                PathUtf8(root) + " (" + ec.message() + ")";
+        return false;
+    }
+
+    fs::path target = root / stamp;
+    for (int suffix = 2; fs::exists(target, ec) && suffix < 1000; ++suffix)
+        target = root / fs::u8path(std::string(stamp) + "-" + std::to_string(suffix));
+    ec.clear();
+    fs::create_directory(target, ec);
+    if (!ec)
+        fs::copy(source, target, fs::copy_options::recursive, ec);
+    if (ec) {
+        if (failure) *failure = "Unable to complete the save backup at " +
+                                PathUtf8(target) + " (" + ec.message() + ")";
+        H->log("sml       save backup FAILED: %s", failure ? failure->c_str() : ec.message().c_str());
+        return false;
+    }
+    if (destination) *destination = target;
+    H->log("sml       saved games backed up to %s", PathUtf8(target).c_str());
+    return true;
+}
+
+static void ShowBackupFailure(const std::string& failure) {
+    std::wstring message = Utf8Wide(
+        "Soviet Mod Loader could not back up your saved games.\r\n\r\n" + failure +
+        "\r\n\r\nThe game will close before any SML configuration is applied.");
+    MessageBoxW(nullptr, message.c_str(), L"Soviet Mod Loader - save backup failed",
+                MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST);
 }
 
 static bool SaveConfirmationIndex(const std::string& index) {
@@ -1118,7 +1176,7 @@ static const SmlApi kApi = {ApiCount, ApiGet, ApiGeneration};
 extern "C" __declspec(dllexport) unsigned TsmPluginApiVersion(void) { return TSM_API_VERSION; }
 
 extern "C" __declspec(dllexport) int TsmPluginInit(const TsmHost* host, TsmPluginInfo* info) {
-    H = host; info->name = "Soviet Mod Loader"; info->version = "0.5.2"; g_base = fs::u8path(host->baseDir);
+    H = host; info->name = "Soviet Mod Loader"; info->version = "0.6.0"; g_base = fs::u8path(host->baseDir);
     g_applicationReady = false; g_pendingConfirmationIndex.clear();
     g_vfsRoot = host->structSize >= offsetof(TsmHost, vfsRoot) + sizeof(host->vfsRoot) && host->vfsRoot
               ? fs::u8path(host->vfsRoot) : ResolveVfsRoot(g_base);
@@ -1172,12 +1230,21 @@ extern "C" __declspec(dllexport) int TsmPluginInit(const TsmHost* host, TsmPlugi
         ReadText(g_stateDir / "confirmation.index", previousConfirmation);
         if (ShouldRequestConfirmation(g_confirmationMode, confirmationIndex,
                                       previousConfirmation, !g_mods.empty())) {
-            if (!ConfirmModsWithUser()) {
+            bool backupSaves = true;
+            if (!ConfirmModsWithUser(&backupSaves)) {
                 H->log("sml       mod configuration refused by user; terminating before application");
                 ExitProcess(ERROR_CANCELLED);
                 return 1;
             }
             H->log("sml       mod configuration accepted by user");
+            if (backupSaves) {
+                fs::path backupPath; std::string backupFailure;
+                if (!BackupSavedGames(&backupPath, &backupFailure)) {
+                    ShowBackupFailure(backupFailure);
+                    ExitProcess(ERROR_WRITE_FAULT);
+                    return 1;
+                }
+            } else H->log("sml       save backup declined by user");
         }
 
         fs::create_directories(g_stateDir, ec);

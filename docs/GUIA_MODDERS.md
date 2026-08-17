@@ -1,40 +1,37 @@
-# Guia para desenvolvedores de mods
+# Mod developer guide
 
-O SML lê o mod diretamente da pasta da Steam Workshop. O contrato é um
-manifesto `soviet.mod.ini`, fragmentos de conteúdo opcionais, assets com os
-caminhos finais do VFS e hooks nativos opcionais.
+SML reads mods directly from their Steam Workshop directories. A mod consists
+of a `soviet.mod.ini` manifest, optional content fragments, VFS-ready assets,
+and optional native TesmioLoader hooks.
 
-Comece copiando [`template/simple-mod`](../template/simple-mod). O template é
-um exemplo mínimo e pode ser reduzido aos domínios usados pelo seu mod.
+Start by copying [`template/simple-mod`](../template/simple-mod), then remove
+the domains your mod does not use.
 
-## Estrutura recomendada
+## Recommended layout
 
 ```text
-meu-mod/
-├── soviet.mod.ini
-├── tesmio/
-│   ├── buildings.ini
-│   ├── resources.ini
-│   ├── deposits.ini
-│   └── needs.ini
-├── assets/
-│   └── media_soviet/...
-└── hooks/
-    └── meu_hook.dll
+my-mod/
+|-- soviet.mod.ini
+|-- tesmio/
+|   |-- buildings.ini
+|   |-- resources.ini
+|   |-- deposits.ini
+|   `-- needs.ini
+|-- assets/
+|   `-- media_soviet/...
+`-- hooks/
+    `-- my_hook.dll
 ```
 
-O caminho dentro de `assets` deve ser exatamente o caminho desejado dentro de
-`tesmioloader/vfs`. Não inclua arquivos gerados, catálogos internos ou cópias
-dos INIs finais do loader.
+Paths below `assets` must match their final paths inside `tesmioloader/vfs`.
+Do not publish generated catalogs, merged INIs, or per-world DDS files.
 
-## Manifesto
-
-Exemplo:
+## Manifest
 
 ```ini
 [mod]
-id = org.exemplo.industria.simples
-name = Indústria Simples
+id = org.example.simple.industry
+name = Simple Industry
 version = 1.0.0
 enabled = 1
 priority = 0
@@ -42,7 +39,7 @@ tesmio_api_min = 3
 tesmio_api_max = 4
 
 [dependencies]
-org.exemplo.biblioteca = >=1.2.0
+org.example.library = >=1.2.0
 
 [content]
 resources = tesmio\resources.ini
@@ -52,133 +49,131 @@ buildings = tesmio\buildings.ini
 assets = assets
 
 [hooks]
-dll = hooks\meu_hook.dll
+dll = hooks\my_hook.dll
 ```
 
-Regras:
+- `id` is a permanent globally unique identifier, preferably reverse DNS.
+- `version` follows semantic versioning.
+- `enabled = 0` disables the complete item.
+- Higher `priority` values apply later.
+- `tesmio_api_min/max` define the accepted host API range.
+- Dependencies use `mod.id = version constraint`.
+- `dll` may be repeated for multiple hooks.
 
-- `id`: identificador global e permanente, preferencialmente DNS reverso; não
-  o altere depois de publicar.
-- `version`: versão semântica do mod.
-- `enabled`: `0` desativa o item inteiro.
-- `priority`: desempate explícito; valores maiores são aplicados mais tarde.
-- `tesmio_api_min/max`: intervalo da API do host aceito pelo mod.
-- dependências: uma entrada `id = restrição` por mod necessário.
-- `dll`: pode se repetir para mais de um hook.
+Dependencies precede dependants. Priority, addition time, and mod ID then
+produce a stable order. When two mods define the same entry, the later entry
+wins; unrelated content from the earlier mod remains active.
 
-A ordem final coloca dependências antes dos dependentes e depois considera
-prioridade, data de adição e ID. Quando dois mods definem o mesmo conteúdo, o
-posterior vence somente naquela entrada; o restante do mod perdedor continua.
+## Internal numeric catalog
 
-## Catálogo interno: números que o mod não declara
+Authors declare stable names, not globally coordinated numbers:
 
-Para evitar colisões entre autores, o SML mantém identificadores numéricos
-estáveis no `catalog.ini`. Portanto:
+- do not declare `id` in a `buildings.ini` section;
+- do not declare `type`, `map`, or `component` in `deposits.ini`;
+- do not prefix resource or need entries with explicit slots;
+- keep section names stable and unique within your mod.
 
-- não declare `id` em uma seção de `buildings.ini`;
-- não declare `type`, `map` ou `component` em `deposits.ini`;
-- não prefixe recursos ou necessidades com slots numéricos explícitos;
-- use nomes de seção estáveis e únicos dentro do seu mod.
+SML assigns append-only building IDs, deposit types, and list positions. Mod
+deposits are emitted as `map = auto`; the embedded component assigns a unique
+map/channel. The portable identity is the mod ID plus the section name, not a
+number observed on one installation.
 
-O SML atribui IDs de construções, tipos de depósitos e posições de listas de
-forma append-only. Nos depósitos, o resultado consolidado usa `map = auto`; o
-componente incorporado escolhe mapa e canal. Cada depósito ainda não
-inicializado recebe distribuição própria por partida, e o manifesto do mundo
-preserva os canais existentes.
+## Content fragments
 
-Cada seção pode ajustar somente a geração de canais novos:
+Include only your own content sections. Global component settings are protected
+unless `[content] allow_settings = 1` is explicitly enabled. Required safety
+settings remain SML invariants even then.
+
+Conflicts in `resources` and `needs` are resolved per section/key. A named
+`buildings` or `deposits` section is atomic so repeatable keys such as `line`
+remain together.
+
+SML validates `$PRODUCTION`, `$CONSUMPTION`,
+`$CONSUMPTION_PER_SECOND`, storage resources, resource clones, deposit icons,
+and needs before confirmation. Missing references block the complete plan
+before any file is applied.
+
+A generated building donor must provide at least:
+
+```text
+media_soviet/buildings_types/<donor>.ini
+media_soviet/buildings/<donor>.nmf
+media_soviet/buildings/<donor>.mtl
+```
+
+An `INCOMPLETE` building is fatal. Test donors against the exact supported game
+version.
+
+Use ASCII Tesmio tokens and UTF-8 without BOM for INIs. Display names may use
+Unicode where the source format supports it.
+
+## Deposit richness
+
+Each deposit may adjust only the initial generation of its own channel:
 
 ```ini
-[simple_ore]
-token = $TYPE_MINE_SIMPLE
-radius = ore
-icon = simple_parts
+[natural_gas]
+token = $TYPE_MINE_NATURAL_GAS
+radius = oil
+icon = naturalgas
 richness_offset = 0.03
 ```
 
-`richness_offset` aceita valores de `-0.25` a `+0.25`. O valor é somado ao
-ruído antes do limiar: números positivos tornam as jazidas maiores e mais
-ricas; negativos as tornam menores e mais fracas. O padrão `0.00` reproduz a
-geração anterior. Valores inválidos bloqueiam a carga antes da confirmação.
-Alterar a chave não regenera canais já registrados no manifesto do mundo, para
-preservar pintura, depleção e dados do save.
+`richness_offset` accepts a finite decimal from `-0.25` through `+0.25`. It is
+added to the fractal field before the fixed threshold:
 
-Não dependa do número que apareceu em uma instalação específica. A identidade
-portável é `id do mod + nome da seção`.
+- positive values produce larger, richer deposits;
+- negative values produce smaller, weaker deposits;
+- omitted or `0.00` preserves the original distribution.
 
-## Fragmentos de conteúdo
-
-Copie a sintaxe dos quatro arquivos do template. Inclua apenas seções do seu
-mod; configurações globais são protegidas, salvo quando o manifesto de conteúdo
-permite explicitamente `allow_settings = 1`.
-
-Para `resources` e `needs`, conflitos são resolvidos por seção/chave. Para
-`buildings` e `deposits`, a seção nomeada é atômica, preservando chaves
-repetíveis como `line`.
-
-O SML valida estaticamente referências usadas por `$PRODUCTION`,
-`$CONSUMPTION`, `$CONSUMPTION_PER_SECOND`, storages, clones, ícones de deposits
-e needs. Use sempre o nome textual estável do resource. Uma referência ausente
-é fatal para o conjunto inteiro antes de qualquer INI ou asset ser aplicado.
-
-Um building também precisa de um donor vanilla íntegro. O SML exige pelo menos
-`media_soviet/buildings_types/<donor>.ini`,
-`media_soviet/buildings/<donor>.nmf` e
-`media_soviet/buildings/<donor>.mtl`. A geração `INCOMPLETE` é tratada como
-erro fatal; teste o donor na mesma versão do jogo suportada pelo SML.
-
-Use tokens Tesmio em ASCII e salve INIs como UTF-8 sem BOM. Nomes exibidos ao
-usuário podem usar Unicode quando o formato de origem aceitar.
+Invalid values block startup before confirmation. Changing the setting does
+not regenerate a channel already recorded in a world's manifest; this protects
+saved painting and depletion. The new value applies to new worlds or a deposit
+installed later into an unused channel.
 
 ## Assets
 
-Coloque texturas e demais arquivos abaixo de `assets/media_soviet/...`. O SML
-copia apenas bytes alterados para o VFS real. Um asset removido do mod só é
-apagado do VFS se ainda for idêntico ao último arquivo escrito pelo SML, para
-não destruir uma edição local.
+Place files below `assets/media_soviet/...`. SML copies only changed bytes to
+the resolved VFS. When an asset disappears from a mod, SML removes its staged
+copy only if it still matches the last hash written by SML, preserving local
+edits.
 
-Evite que dois mods publiquem o mesmo caminho. O conflito será determinístico,
-mas o resultado dependerá da ordem resolvida e será informado ao usuário.
+Avoid publishing the same path as another mod. The later mod wins
+deterministically and the conflict appears in the confirmation details.
 
-## Hooks nativos
+## Native hooks
 
-Um hook é um plugin TesmioLoader comum listado em `[hooks]`. Compile-o para
-Windows x64 com runtime estático e os cabeçalhos da API suportada. Exporte:
+A hook is an ordinary TesmioLoader plugin listed under `[hooks]`. Compile for
+Windows x64 with the static runtime and export:
 
 ```cpp
 extern "C" __declspec(dllexport) uint32_t TsmPluginApiVersion();
 extern "C" __declspec(dllexport) int TsmPluginInit(
     const TsmHost* host, TsmPluginInfo* info);
-extern "C" __declspec(dllexport) int TsmPluginStart(); // opcional
+extern "C" __declspec(dllexport) int TsmPluginStart(); // optional
 ```
 
-Use `TsmPluginInit` para validar o host, ler configuração e publicar serviços.
-Consuma serviços de outros plugins e instale hooks dependentes somente em
-`TsmPluginStart`. Verifique `host->structSize` antes de ler campos acrescentados
-pela API 4, como `vfsRoot`. Um erro deve retornar código não zero e desativar
-apenas o hook, sem encerrar o jogo.
+Use `Init` to validate the host, read configuration, and publish services. Use
+`Start` for hooks that depend on services from other plugins. Check
+`host->structSize` before reading API 4 additions such as `vfsRoot`.
 
-Confira a [documentação upstream de plugins](https://github.com/MaxLegend/TesmioLoader/blob/master/docs/09-plugins.md)
-e a [API pública](https://github.com/MaxLegend/TesmioLoader/blob/master/src/tesmio_api.h).
-Hooks que modificam código do jogo precisam validar versão e bytes do prólogo;
-nunca aplique endereços de uma versão em outra.
+Native patches must verify the game version and original prologue bytes. Never
+reuse executable addresses across game versions without revalidation. See the
+[upstream plugin guide](https://github.com/MaxLegend/TesmioLoader/blob/master/docs/09-plugins.md)
+and [public API](https://github.com/MaxLegend/TesmioLoader/blob/master/src/tesmio_api.h).
 
-## Teste antes de publicar
+## Release checklist
 
-1. Trabalhe em uma cópia sob `media_soviet/workshop_wip` e mantenha fora do
-   intervalo interno reservado `9100000000`–`9199999999`.
-2. Use um `id` definitivo desde o primeiro teste.
-3. Inicie pelo `tesmiolauncher.exe` e confira a ordem na confirmação.
-4. Verifique `tesmioloader.log` e `soviet_mod_loader/report.json`.
-5. Teste jogo novo, save/reload e remoção/reinstalação do mod.
-6. Teste dependência ausente e versões incompatíveis.
-7. Teste junto aos mods que podem declarar conteúdo semelhante.
-8. Publique somente os arquivos de origem do mod; não publique o catálogo nem
-   os DDS intermediários/persistidos do seu ambiente.
-9. No log, confirme separadamente: resource registrado, deposit aceito, textura
-   carregada e building completo. Uma linha de DDS gerado não substitui as
-   outras três verificações.
+1. Use the final permanent mod ID from the first test.
+2. Develop outside SML's reserved `9100000000..9199999999` WIP range.
+3. Confirm load order and conflicts in the SML dialog.
+4. Review `tesmioloader.log` and `soviet_mod_loader/report.json`.
+5. Test new game, save, reload, and later installation of new content.
+6. Test missing dependencies and incompatible versions.
+7. Test alongside mods that declare similar content.
+8. Verify resource registration, deposit acceptance, texture loading, and
+   building completeness separately.
+9. Publish only source mod files, never local catalogs or generated DDS files.
 
-Adicionar ou remover recursos, necessidades, construções e depósitos pode
-alterar dados serializados. Documente a compatibilidade de saves e recomende
-backup aos usuários.
+Adding or removing resources, needs, buildings, or deposits can affect
+serialized data. Document save compatibility and recommend backups.
